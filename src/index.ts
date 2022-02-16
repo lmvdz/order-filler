@@ -1,5 +1,7 @@
 import { BN, Provider } from '@project-serum/anchor';
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import * as BufferLayout from '@solana/buffer-layout';
+import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction } from '@solana/web3.js';
+import { u64 } from "@solana/spl-token";
 
 import {
 	BulkAccountLoader,
@@ -21,13 +23,25 @@ import {
 	getPollingClearingHouseConfig,
 	getClearingHouseUser,
 	getPollingClearingHouseUserConfig,
+	calculateOrderFeeTier,
+	calculateFeeForLimitOrder,
+	calculateAmmReservesAfterSwap,
+	SwapDirection,
+	calculateNewMarketAfterTrade,
+	PEG_PRECISION,
+	AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO,
+	BASE_PRECISION
 } from '@drift-labs/sdk';
 
 import { Node, OrderList, sortDirectionForOrder } from './OrderList';
 import { CloudWatchClient } from './cloudWatchClient';
 import { bulkPollingUserSubscribe } from '@drift-labs/sdk/lib/accounts/bulkUserSubscription';
+import * as bs58 from 'bs58';
 
 require('dotenv').config();
+
+
+
 //@ts-ignore
 const sdkConfig = initialize({ env: process.env.ENV });
 
@@ -36,11 +50,34 @@ const cloudWatchClient = new CloudWatchClient(
 	process.env.ENABLE_CLOUDWATCH === 'true'
 );
 
+
+
 function getWallet(): Wallet {
-	const privateKey = process.env.FILLER_PRIVATE_KEY;
-	const keypair = Keypair.fromSecretKey(
-		Uint8Array.from(privateKey.split(',').map((val) => Number(val)))
-	);
+	const botKeyEnvVariable = "BOT_KEY";
+	// ENVIRONMENT VARIABLE FOR THE BOT PRIVATE KEY
+	const botKey = process.env[botKeyEnvVariable];
+
+	if (botKey === undefined) {
+		console.error('need a ' + botKeyEnvVariable +' env variable');
+		process.exit();
+	}
+	// setup wallet
+	let keypair;
+
+	try {
+		keypair = Keypair.fromSecretKey(
+			bs58.decode(botKey, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+		);
+	} catch {
+		try {
+			keypair = Keypair.fromSecretKey(
+				Uint8Array.from(JSON.parse(botKey))
+			);
+		} catch {
+			console.error('Failed to parse private key from Uint8Array (solana-keygen) and base58 encoded string (phantom wallet export)');
+			process.exit();
+		}
+	}
 	return new Wallet(keypair);
 }
 
@@ -81,17 +118,11 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		const userOrdersAccount: UserOrdersAccount = programAccount.account;
 		const userAccountPublicKey = userOrdersAccount.user;
 
-		for (const order of userOrdersAccount.orders) {
-			if (isVariant(order, 'init') || isVariant(order.orderType, 'market')) {
-				continue;
+		userOrdersAccount.orders.forEach(async order => {
+			if (!isVariant(order, 'init') && !isVariant(order.orderType, 'market')) {
+				marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)].insert(order, userAccountPublicKey, userOrderAccountPublicKey);
 			}
-
-			const ordersList = marketOrderLists.get(order.marketIndex.toNumber());
-			const sortDirection = sortDirectionForOrder(order);
-			const orderList =
-				sortDirection === 'desc' ? ordersList.desc : ordersList.asc;
-			orderList.insert(order, userAccountPublicKey, userOrderAccountPublicKey);
-		}
+		});
 	}
 
 	const printTopOfOrdersList = (ascList: OrderList, descList: OrderList) => {
@@ -119,16 +150,16 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 
 	const updateUserOrders = (user: ClearingHouseUser): BN => {
 		const marginRatio = user.getMarginRatio();
-		const tooMuchLeverage = marginRatio.lte(
-			user.clearingHouse.getStateAccount().marginRatioInitial
-		);
 
-		if (user.getUserOrdersAccount()) {
-			for (const order of user.getUserOrdersAccount().orders) {
-				const ordersLists = marketOrderLists.get(order.marketIndex.toNumber());
-				const sortDirection = sortDirectionForOrder(order);
-				const orderList =
-					sortDirection === 'desc' ? ordersLists.desc : ordersLists.asc;
+		const userOrdersAccount = user.getUserOrdersAccount();
+
+		if (userOrdersAccount) {
+			const tooMuchLeverage = marginRatio.lte(
+				user.clearingHouse.getStateAccount().marginRatioInitial
+			);
+
+			userOrdersAccount.orders.forEach(async order => {
+				const orderList = marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)];
 				const orderIsRiskIncreasing = isOrderRiskIncreasing(user, order);
 
 				if (tooMuchLeverage && orderIsRiskIncreasing) {
@@ -138,7 +169,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				} else {
 					orderList.updateUserCanTake(order.orderId.toNumber(), true);
 				}
-			}
+			});
 		}
 		return marginRatio;
 	};
@@ -207,10 +238,8 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			return;
 		}
 
-		const sortDirection = sortDirectionForOrder(order);
 		const ordersList = marketOrderLists.get(order.marketIndex.toNumber());
-		const orderList =
-			sortDirection === 'desc' ? ordersList.desc : ordersList.asc;
+		const orderList = ordersList[sortDirectionForOrder(order)];
 
 		if (isVariant(record.action, 'place')) {
 			const userOrdersAccountPublicKey = await getUserOrdersAccountPublicKey(
@@ -248,6 +277,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		}
 		updateOrderListMutex = 0;
 	};
+
 	clearingHouse.eventEmitter.on('orderHistoryAccountUpdate', updateOrderList);
 	await updateOrderList();
 
@@ -320,38 +350,59 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			console.log(
 				`trying to fill (account: ${nodeToFill.userAccount.toString()})`
 			);
-			clearingHouse
-				.fillOrder(
-					nodeToFill.userAccount,
-					nodeToFill.userOrdersAccount,
-					nodeToFill.order
-				)
-				.then((txSig) => {
-					console.log(
-						`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
-					);
-					console.log(`Tx: ${txSig}`);
-					cloudWatchClient.logFill(true);
-				})
-				.catch(() => {
-					nodeToFill.haveFilled = false;
-					userMap.set(nodeToFill.userAccount.toString(), {
-						user,
-						upToDate: true,
-					});
-					console.log(
-						`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
-					);
-					cloudWatchClient.logFill(false);
+			const frontRun = new Transaction();
+			
+			const clock = await getClock(connection);
+
+			const [fillOrderNewQuoteAssetReserve,] =  calculateAmmReservesAfterSwap(market.amm, 'base', (nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)), SwapDirection.REMOVE);
+			const maxPossibleFillOrderQuoteAmount = (fillOrderNewQuoteAssetReserve.sub(market.amm.quoteAssetReserve)).mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO);
+			const maxLimitOrderFee = calculateFeeForLimitOrder(maxPossibleFillOrderQuoteAmount, clearingHouse.getStateAccount().feeStructure, clearingHouse.getOrderStateAccount().orderFillerRewardStructure, calculateOrderFeeTier(clearingHouse.getStateAccount().feeStructure), nodeToFill.order.ts, clock.unixTimestamp);
+			
+			const [, fillerRewardNewBaseAssetReserve] =  calculateAmmReservesAfterSwap(market.amm, 'quote', maxLimitOrderFee.fillerReward, SwapDirection.ADD);
+			
+
+			const newMarket = calculateNewMarketAfterTrade((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled).add((fillerRewardNewBaseAssetReserve.mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO)))), nodeToFill.order.direction, market);
+
+			const marketPrice = convertToNumber(markPrice, MARK_PRICE_PRECISION);
+			const marketPriceAfter = convertToNumber(calculateMarkPrice(newMarket), MARK_PRICE_PRECISION);
+			const spread = Math.abs(marketPrice - marketPriceAfter);
+			const maxFillerReward = convertToNumber(maxLimitOrderFee.fillerReward, new BN(10 ** 6));
+			const maxFrontRunQuoteAmount = (maxFillerReward + (spread)) * (10 ** 6);
+
+			// console.log(convertToNumber(limitOrderFee.fillerReward, new BN(10 ** 6)), quoteSwapAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.baseAssetAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.ts.toNumber(), clock.unixTimestamp.toNumber());
+			// console.log((((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION)))).toNumber());
+			// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, ((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION))), nodeToFill.order.marketIndex));
+			// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, frontRunQuoteAmount, nodeToFill.order.marketIndex));
+			console.log(convertToNumber(nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled), BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
+			frontRun.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
+			// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
+
+			try {
+				const txSig = await clearingHouse.txSender.send(frontRun, [], clearingHouse.opts);
+				console.log(
+					`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
+				);
+				console.log(`Tx: ${txSig}`);
+				cloudWatchClient.logFill(true);
+			} catch (error) {
+				nodeToFill.haveFilled = false;
+				userMap.set(nodeToFill.userAccount.toString(), {
+					user,
+					upToDate: true,
 				});
+				console.log(
+					`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
+				);
+				cloudWatchClient.logFill(false);
+			}
 		}
 		perMarketMutex[marketIndex.toNumber()] = 0;
 	};
 
 	const tryFill = () => {
-		for (const market of Markets) {
+		Markets.forEach(async market => {
 			tryFillForMarket(market.marketIndex);
-		}
+		});
 	};
 
 	tryFill();
@@ -391,4 +442,52 @@ const clearingHouse = getClearingHouse(
 	)
 );
 
+const uint64 = (property = "uint64") => {
+    return BufferLayout.blob(8, property);
+};
+
+function uint8ToU64(data) {
+    return new u64(data, 10, "le");
+}
+
+
+const CLOCK_LAYOUT = BufferLayout.struct([
+	uint64('slot'),
+	uint64('epochStartTimestamp'),
+	uint64('epoch'),
+	uint64('leaderScheduleEpoch'),
+	uint64('unixTimestamp')
+
+]);
+
+interface Clock {
+	slot: u64,
+	epochStartTimestamp: u64,
+	epoch: u64,
+	leaderScheduleEpoch: u64,
+	unixTimestamp: u64
+}
+
+const getClock = ( connection: Connection ) : Promise<Clock> => {
+	return new Promise((resolve) => {
+		connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, 'processed').then(clockAccountInfo => {
+			const decoded = CLOCK_LAYOUT.decode(Uint8Array.from(clockAccountInfo.data));
+			resolve({
+				slot: uint8ToU64(decoded.slot),
+				epochStartTimestamp: uint8ToU64(decoded.epochStartTimestamp),
+				epoch: uint8ToU64(decoded.epoch),
+				leaderScheduleEpoch: uint8ToU64(decoded.leaderScheduleEpoch),
+				unixTimestamp: uint8ToU64(decoded.unixTimestamp),
+			} as Clock);
+		});
+	});
+};
+
+getClock(connection).then(clock => {
+	console.log(clock.unixTimestamp.toNumber());
+});
+
 recursiveTryCatch(() => runBot(wallet, clearingHouse));
+
+
+

@@ -5,7 +5,7 @@
 	"main": "lib/index.js",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"@drift-labs/sdk": "0.1.18-orders.5",
+		"@drift-labs/sdk": "file:../protocol-v1/sdk",
 		"@project-serum/anchor": "^0.19.1-beta.1",
 		"@solana/spl-token": "^0.1.8",
 		"@solana/web3.js": "^1.22.0",
@@ -27,6 +27,8 @@
 	"scripts": {
 		"prepare": "husky install",
 		"build": "yarn clean && tsc",
+		"build-win": "yarn clean-win && tsc",
+		"clean-win": "rmdir /s /q lib",
 		"clean": "rm -rf lib",
 		"start": "node lib/index.js",
 		"prettify": "prettier --check './src/**/*.ts'",
