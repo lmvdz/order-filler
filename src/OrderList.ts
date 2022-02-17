@@ -18,7 +18,6 @@ export class Node {
 	previous?: Node;
 	haveFilled = false;
 	sortDirection: SortDirection;
-	userCanTake = true;
 
 	constructor(
 		order: Order,
@@ -82,10 +81,10 @@ export class Node {
 		}
 		if (this.order.triggerPrice.gt(ZERO)) {
 			msg += ` ${
-				isVariant(this.order.triggerPrice, 'below') ? 'BELOW' : 'ABOVE'
+				isVariant(this.order.triggerCondition, 'below') ? 'BELOW' : 'ABOVE'
 			}`;
 			msg += ` ${convertToNumber(
-				this.order.price,
+				this.order.triggerPrice,
 				MARK_PRICE_PRECISION
 			).toFixed(3)}`;
 		}
@@ -183,13 +182,6 @@ export class OrderList {
 		}
 	}
 
-	public updateUserCanTake(orderId: number, userCanTake: boolean): void {
-		if (this.nodeMap.has(orderId)) {
-			const node = this.nodeMap.get(orderId);
-			node.userCanTake = userCanTake;
-		}
-	}
-
 	public remove(orderId: number): void {
 		if (this.nodeMap.has(orderId)) {
 			const node = this.nodeMap.get(orderId);
@@ -211,6 +203,10 @@ export class OrderList {
 
 			this.length--;
 		}
+	}
+
+	public has(orderId: number): boolean {
+		return this.nodeMap.has(orderId);
 	}
 
 	public print(): void {

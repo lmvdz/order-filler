@@ -38,6 +38,7 @@ import { Node, OrderList, sortDirectionForOrder } from './OrderList';
 import { CloudWatchClient } from './cloudWatchClient';
 import { bulkPollingUserSubscribe } from '@drift-labs/sdk/lib/accounts/bulkUserSubscription';
 import * as bs58 from 'bs58';
+import { getErrorCode } from './error';
 
 require('dotenv').config();
 
@@ -105,6 +106,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			asc: shorts,
 		});
 	}
+	const openOrders = new Set<number>();
 
 	// explicitly grab order index before we initially build order list
 	// so we're less likely to have missed records while we fetch order accounts
@@ -123,6 +125,14 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			if (!isVariant(order, 'init') && !isVariant(order.orderType, 'market')) {
 				marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)].insert(order, userAccountPublicKey, userOrderAccountPublicKey);
 			}
+
+			const ordersList = marketOrderLists.get(order.marketIndex.toNumber());
+			const sortDirection = sortDirectionForOrder(order);
+			const orderList = sortDirection === 'desc' ? ordersList.desc : ordersList.asc;
+			orderList.insert(order, userAccountPublicKey, userOrderAccountPublicKey);
+			if (isVariant(order.status, 'open')) {
+				openOrders.add(order.orderId.toNumber());
+			}
 		});
 	}
 
@@ -139,9 +149,12 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		ascList.printTop();
 	};
 
-	for (const [_, ordersList] of marketOrderLists) {
-		printTopOfOrdersList(ordersList.asc, ordersList.desc);
-	}
+	const printOrderLists = () => {
+		for (const [_, ordersList] of marketOrderLists) {
+			printTopOfOrdersList(ordersList.asc, ordersList.desc);
+		}
+	};
+	printOrderLists();
 
 	const sleep = (ms: number) => {
 		return new Promise((resolve) => {
@@ -149,7 +162,11 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		});
 	};
 
-	const updateUserOrders = (user: ClearingHouseUser): BN => {
+	const updateUserOrders = (
+		user: ClearingHouseUser,
+		userAccountPublicKey: PublicKey,
+		userOrdersAccountPublicKey: PublicKey
+	): BN => {
 		const marginRatio = user.getMarginRatio();
 
 		const userOrdersAccount = user.getUserOrdersAccount();
@@ -160,15 +177,37 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			);
 
 			userOrdersAccount.orders.forEach(async order => {
-				const orderList = marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)];
+				const ordersLists = marketOrderLists.get(order.marketIndex.toNumber());
+				const orderList = ordersLists[sortDirectionForOrder(order)];
 				const orderIsRiskIncreasing = isOrderRiskIncreasing(user, order);
 
+				const orderId = order.orderId.toNumber();
 				if (tooMuchLeverage && orderIsRiskIncreasing) {
-					orderList.updateUserCanTake(order.orderId.toNumber(), false);
+					if (openOrders.has(orderId) && orderList.has(orderId)) {
+						console.log(
+							`User has too much leverage and order is risk increasing. Removing order ${order.orderId.toString()}`
+						);
+						orderList.remove(orderId);
+						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+					}
 				} else if (orderIsRiskIncreasing && order.reduceOnly) {
-					orderList.updateUserCanTake(order.orderId.toNumber(), false);
+					if (openOrders.has(orderId) && orderList.has(orderId)) {
+						console.log(
+							`Order ${order.orderId.toString()} is risk increasing but reduce only. Removing`
+						);
+						orderList.remove(orderId);
+						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+					}
 				} else {
-					orderList.updateUserCanTake(order.orderId.toNumber(), true);
+					if (openOrders.has(orderId) && !orderList.has(orderId)) {
+						console.log(`Order ${order.orderId.toString()} added back`);
+						orderList.insert(
+							order,
+							userAccountPublicKey,
+							userOrdersAccountPublicKey
+						);
+						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+					}
 				}
 			});
 		}
@@ -176,15 +215,21 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 	};
 	const processUser = async (user: ClearingHouseUser) => {
 		const userAccountPublicKey = await user.getUserAccountPublicKey();
+		const userOrdersAccountPublicKey =
+			await user.getUserOrdersAccountPublicKey();
 
 		user.eventEmitter.on('userPositionsData', () => {
-			updateUserOrders(user);
+			updateUserOrders(user, userAccountPublicKey, userOrdersAccountPublicKey);
 			userMap.set(userAccountPublicKey.toString(), { user, upToDate: true });
 		});
 
 		// eslint-disable-next-line no-constant-condition
 		while (true) {
-			const marginRatio = updateUserOrders(user);
+			const marginRatio = updateUserOrders(
+				user,
+				userAccountPublicKey,
+				userOrdersAccountPublicKey
+			);
 			const marginRatioNumber = convertToNumber(marginRatio, TEN_THOUSAND);
 			const oneMinute = 1000 * 60;
 			const sleepTime = Math.min(
@@ -248,17 +293,28 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				record.user
 			);
 			orderList.insert(order, record.user, userOrdersAccountPublicKey);
-			console.log(`Order ${order.orderId.toString()} placed. Added to order list`);
+			openOrders.add(order.orderId.toNumber());
+			console.log(
+				`Order ${order.orderId.toString()} placed. Added to order list`
+			);
 		} else if (isVariant(record.action, 'cancel')) {
 			orderList.remove(order.orderId.toNumber());
-			console.log(`Order ${order.orderId.toString()} canceled. Removed from order list`);
+			openOrders.delete(order.orderId.toNumber());
+			console.log(
+				`Order ${order.orderId.toString()} canceled. Removed from order list`
+			);
 		} else if (isVariant(record.action, 'fill')) {
 			if (order.baseAssetAmount.eq(order.baseAssetAmountFilled)) {
 				orderList.remove(order.orderId.toNumber());
-				console.log(`Order ${order.orderId.toString()} completely filled. Removed from order list`);
+				openOrders.delete(order.orderId.toNumber());
+				console.log(
+					`Order ${order.orderId.toString()} completely filled. Removed from order list`
+				);
 			} else {
 				orderList.update(order);
-				console.log(`Order ${order.orderId.toString()} partially filled. Updated`);
+				console.log(
+					`Order ${order.orderId.toString()} partially filled. Updated`
+				);
 			}
 		}
 		printTopOfOrdersList(ordersList.asc, ordersList.desc);
@@ -315,8 +371,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				processUser(user);
 			}
 			const { upToDate: userUpToDate } = mapValue;
-
-			if (!currentNode.haveFilled && userUpToDate && currentNode.userCanTake) {
+			if (!currentNode.haveFilled && userUpToDate) {
 				break;
 			}
 
@@ -340,7 +395,10 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		let nodeToFill: Node | undefined = undefined;
 		if (orderLists.asc.head && orderLists.asc.head.pricesCross(markPrice)) {
 			nodeToFill = await findNodeToFill(orderLists.asc.head, markPrice);
-		} else if (
+		}
+
+		if (
+			nodeToFill === undefined &&
 			orderLists.desc.head &&
 			orderLists.desc.head.pricesCross(markPrice)
 		) {
@@ -400,6 +458,19 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 					`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 				);
 				cloudWatchClient.logFill(false);
+
+				// If we get an error that order does not exist, assume its been filled by somebody else and we
+				// have received the history record yet
+				const errorCode = getErrorCode(error);
+				if (errorCode === 6043) {
+					console.log(
+						`Order ${nodeToFill.order.orderId.toString()} not found when trying to fill. Removing from order list`
+					);
+					orderLists[nodeToFill.sortDirection].remove(
+						nodeToFill.order.orderId.toNumber()
+					);
+					printTopOfOrdersList(orderLists.asc, orderLists.desc);
+				}
 			}
 		}
 		perMarketMutex[marketIndex.toNumber()] = 0;
@@ -412,7 +483,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 	};
 
 	tryFill();
-	const handleFillIntervalId = setInterval(tryFill, 1000); // every second
+	const handleFillIntervalId = setInterval(tryFill, 500); // every half second
 	intervalIds.push(handleFillIntervalId);
 };
 

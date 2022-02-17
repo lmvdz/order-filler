@@ -168,9 +168,9 @@
     dotenv "10.0.0"
 
 "@solana/web3.js@^1.17.0", "@solana/web3.js@^1.21.0", "@solana/web3.js@^1.22.0", "@solana/web3.js@^1.30.2":
-  version "1.34.0"
-  resolved "https://registry.yarnpkg.com/@solana/web3.js/-/web3.js-1.34.0.tgz#33becf2c7e87497d73406374185e54e0b7bc235d"
-  integrity sha512-6QvqN2DqEELvuV+5yUQM8P9fRiSG+6SzQ58HjumJqODu14r7eu5HXVWEymvKAvMLGME+0TmAdJHjw9xD5NgUWA==
+  version "1.35.0"
+  resolved "https://registry.yarnpkg.com/@solana/web3.js/-/web3.js-1.35.0.tgz#a2d09add241f48a370470a5c4db8596cb13f0dc6"
+  integrity sha512-eKf2rPoWEyVq7QsgAQKNqxODvPsb0vqSwwg2xRY1e49Fn5Qh29m2FiLcYHRS/xhPu/7b/5gsD+RzO3BWozOeZQ==
   dependencies:
     "@babel/runtime" "^7.12.5"
     "@ethersproject/sha2" "^5.5.0"
@@ -424,9 +424,9 @@ available-typed-arrays@^1.0.5:
   integrity sha512-DMD0KiN46eipeziST1LPP/STfDU0sufISXmjSgvVsoU2tqxctQeASejWcfNtxYKqETM1UxQ8sp2OrSBWpHY6sw==
 
 aws-sdk@^2.1062.0:
-  version "2.1074.0"
-  resolved "https://registry.yarnpkg.com/aws-sdk/-/aws-sdk-2.1074.0.tgz#be3283f781b3060cd67d5abef50d1edacefede70"
-  integrity sha512-tD478mkukglutjs+mq5FQmYFzz+l/wddl5u3tTMWTNa+j1eSL+AqaHPFM1rC3O9h98QqpKKzeKbLrPhGDvYaRg==
+  version "2.1076.0"
+  resolved "https://registry.yarnpkg.com/aws-sdk/-/aws-sdk-2.1076.0.tgz#6a8b7b9ec46f22f4c6bf775c4b11749c03397403"
+  integrity sha512-V2nLKCPG4mtKNkmET1eQQNHpEdkBF7pW/i05Qg+umTQlbLgaiL9u4vSTbn5xXeDMwejKiz3J2MB2eemV6uRUUg==
   dependencies:
     buffer "4.9.2"
     events "1.1.1"
