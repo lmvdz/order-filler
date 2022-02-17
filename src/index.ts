@@ -30,7 +30,8 @@ import {
 	calculateNewMarketAfterTrade,
 	PEG_PRECISION,
 	AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO,
-	BASE_PRECISION
+	BASE_PRECISION,
+	calculateAmountToTrade
 } from '@drift-labs/sdk';
 
 import { Node, OrderList, sortDirectionForOrder } from './OrderList';
@@ -358,14 +359,15 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 			
 			const clock = await getClock(connection);
 
-			const [fillOrderNewQuoteAssetReserve,] =  calculateAmmReservesAfterSwap(market.amm, 'base', (nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)), SwapDirection.REMOVE);
+			const maxOrderFillPossible = calculateAmountToTrade(market, nodeToFill.order);
+
+			const [fillOrderNewQuoteAssetReserve,] =  calculateAmmReservesAfterSwap(market.amm, 'base', maxOrderFillPossible, SwapDirection.REMOVE);
 			const maxPossibleFillOrderQuoteAmount = (fillOrderNewQuoteAssetReserve.sub(market.amm.quoteAssetReserve)).mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO);
 			const maxLimitOrderFee = calculateFeeForLimitOrder(maxPossibleFillOrderQuoteAmount, clearingHouse.getStateAccount().feeStructure, clearingHouse.getOrderStateAccount().orderFillerRewardStructure, calculateOrderFeeTier(clearingHouse.getStateAccount().feeStructure), nodeToFill.order.ts, clock.unixTimestamp);
 			
 			const [, fillerRewardNewBaseAssetReserve] =  calculateAmmReservesAfterSwap(market.amm, 'quote', maxLimitOrderFee.fillerReward, SwapDirection.ADD);
-			
 
-			const newMarket = calculateNewMarketAfterTrade((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled).add((fillerRewardNewBaseAssetReserve.mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO)))), nodeToFill.order.direction, market);
+			const newMarket = calculateNewMarketAfterTrade((maxOrderFillPossible.add((fillerRewardNewBaseAssetReserve.mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO)))), nodeToFill.order.direction, market);
 
 			const marketPrice = convertToNumber(markPrice, MARK_PRICE_PRECISION);
 			const marketPriceAfter = convertToNumber(calculateMarkPrice(newMarket), MARK_PRICE_PRECISION);
@@ -473,7 +475,7 @@ interface Clock {
 }
 
 const getClock = ( connection: Connection ) : Promise<Clock> => {
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
 		connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, 'processed').then(clockAccountInfo => {
 			const decoded = CLOCK_LAYOUT.decode(Uint8Array.from(clockAccountInfo.data));
 			resolve({
@@ -483,12 +485,16 @@ const getClock = ( connection: Connection ) : Promise<Clock> => {
 				leaderScheduleEpoch: uint8ToU64(decoded.leaderScheduleEpoch),
 				unixTimestamp: uint8ToU64(decoded.unixTimestamp),
 			} as Clock);
+		}).catch(error => {
+			reject(error);
 		});
 	});
 };
 
 getClock(connection).then(clock => {
 	console.log(clock.unixTimestamp.toNumber());
+}).catch(error => {
+	console.error(error);
 });
 
 recursiveTryCatch(() => runBot(wallet, clearingHouse));
