@@ -31,7 +31,8 @@ import {
 	PEG_PRECISION,
 	AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO,
 	BASE_PRECISION,
-	calculateAmountToTrade
+	calculateAmountToTrade,
+	QUOTE_PRECISION,
 } from '@drift-labs/sdk';
 
 import { Node, OrderList, sortDirectionForOrder } from './OrderList';
@@ -254,6 +255,14 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		const userArray: ClearingHouseUser[] = [];
 		for (const programUserAccount of programUserAccounts) {
 			const userAccountPubkey = programUserAccount.publicKey.toString();
+
+			// if the user has less than one dollar in account, disregard initially
+			// if an order comes from this user, we can add them then.
+			// This makes it so that we don't need to listen to inactive users
+			if (programUserAccount.account.collateral.lt(QUOTE_PRECISION)) {
+				continue;
+			}
+
 			if (userMap.has(userAccountPubkey)) {
 				continue;
 			}
@@ -342,10 +351,11 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 	clearingHouse.eventEmitter.on('orderHistoryAccountUpdate', updateOrderList);
 	await updateOrderList();
 
-	const findNodeToFill = async (
+	const findNodesToFill = async (
 		node: Node,
 		markPrice: BN
-	): Promise<Node | undefined> => {
+	): Promise<Node[]> => {
+		const nodesToFill = [];
 		let currentNode = node;
 		while (currentNode !== undefined) {
 			if (!currentNode.pricesCross(markPrice)) {
@@ -370,14 +380,15 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				userMap.set(node.userAccount.toString(), mapValue);
 				processUser(user);
 			}
-			if (!currentNode.haveFilled && mapValue.upToDate) {
-				break;
+			const { upToDate: userUpToDate } = mapValue;
+			if (!currentNode.haveFilled && userUpToDate) {
+				nodesToFill.push(currentNode);
 			}
 
 			currentNode = currentNode.next;
 		}
 
-		return currentNode;
+		return nodesToFill;
 	};
 
 	const perMarketMutex = Array(64).fill(0);
@@ -391,28 +402,33 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		const orderLists = marketOrderLists.get(marketIndex.toNumber());
 		const markPrice = calculateMarkPrice(market);
 
-		let nodeToFill: Node | undefined = undefined;
+		const nodesToFill: Node[] = [];
 		if (orderLists.asc.head && orderLists.asc.head.pricesCross(markPrice)) {
-			nodeToFill = await findNodeToFill(orderLists.asc.head, markPrice);
+			nodesToFill.push(
+				...(await findNodesToFill(orderLists.asc.head, markPrice))
+			);
 		}
 
-		if (
-			nodeToFill === undefined &&
-			orderLists.desc.head &&
-			orderLists.desc.head.pricesCross(markPrice)
-		) {
-			nodeToFill = await findNodeToFill(orderLists.desc.head, markPrice);
+		if (orderLists.desc.head && orderLists.desc.head.pricesCross(markPrice)) {
+			nodesToFill.push(
+				...(await findNodesToFill(orderLists.desc.head, markPrice))
+			);
 		}
 
-		if (nodeToFill !== undefined && !nodeToFill.haveFilled) {
-			const { user } = userMap.get(nodeToFill.userAccount.toString());
-			if (user !== undefined) {
-				userMap.set(nodeToFill.userAccount.toString(), { user, upToDate: false });
+		nodesToFill
+			.filter((nodeToFill) => !nodeToFill.haveFilled)
+			.forEach(async (nodeToFill) => {
+				const { user } = userMap.get(nodeToFill.userAccount.toString());
+				userMap.set(nodeToFill.userAccount.toString(), {
+					user,
+					upToDate: false,
+				});
 				nodeToFill.haveFilled = true;
 
 				console.log(
 					`trying to fill (account: ${nodeToFill.userAccount.toString()})`
 				);
+
 				const tx = new Transaction();
 				
 				const clock = await getClock(connection);
@@ -440,7 +456,6 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				console.log(convertToNumber(maxOrderFillPossible, BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
 				tx.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
 				// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
-
 				try {
 					const txSig = await clearingHouse.txSender.send(tx, [], clearingHouse.opts);
 					console.log(
@@ -448,7 +463,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 					);
 					console.log(`Tx: ${txSig}`);
 					cloudWatchClient.logFill(true);
-				} catch (error) {
+				} catch(error) {
 					nodeToFill.haveFilled = false;
 					userMap.set(nodeToFill.userAccount.toString(), {
 						user,
@@ -472,8 +487,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 						printTopOfOrdersList(orderLists.asc, orderLists.desc);
 					}
 				}
-			}
-		}
+			});
 		perMarketMutex[marketIndex.toNumber()] = 0;
 	};
 
