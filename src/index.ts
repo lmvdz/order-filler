@@ -33,6 +33,7 @@ import {
 	BASE_PRECISION,
 	calculateAmountToTrade,
 	QUOTE_PRECISION,
+	DriftEnv
 } from '@drift-labs/sdk';
 
 import { Node, OrderList, sortDirectionForOrder } from './OrderList';
@@ -46,7 +47,7 @@ require('dotenv').config();
 
 
 //@ts-ignore
-const sdkConfig = initialize({ env: process.env.ENV });
+const sdkConfig = initialize({ env: process.env.ENV as DriftEnv });
 
 const cloudWatchClient = new CloudWatchClient(
 	sdkConfig.ENV === 'mainnet-beta' ? 'eu-west-1' : 'us-east-1',
@@ -455,6 +456,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, frontRunQuoteAmount, nodeToFill.order.marketIndex));
 				console.log(convertToNumber(maxOrderFillPossible, BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
 				tx.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
+				
 				// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
 				try {
 					const txSig = await clearingHouse.txSender.send(tx, [], clearingHouse.opts);
