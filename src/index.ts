@@ -370,8 +370,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				userMap.set(node.userAccount.toString(), mapValue);
 				processUser(user);
 			}
-			const { upToDate: userUpToDate } = mapValue;
-			if (!currentNode.haveFilled && userUpToDate) {
+			if (!currentNode.haveFilled && mapValue.upToDate) {
 				break;
 			}
 
@@ -407,69 +406,71 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 
 		if (nodeToFill !== undefined && !nodeToFill.haveFilled) {
 			const { user } = userMap.get(nodeToFill.userAccount.toString());
-			userMap.set(nodeToFill.userAccount.toString(), { user, upToDate: false });
-			nodeToFill.haveFilled = true;
+			if (user !== undefined) {
+				userMap.set(nodeToFill.userAccount.toString(), { user, upToDate: false });
+				nodeToFill.haveFilled = true;
 
-			console.log(
-				`trying to fill (account: ${nodeToFill.userAccount.toString()})`
-			);
-			const frontRun = new Transaction();
-			
-			const clock = await getClock(connection);
-
-			const maxOrderFillPossible = calculateAmountToTrade(market, nodeToFill.order);
-
-			const [fillOrderNewQuoteAssetReserve,] =  calculateAmmReservesAfterSwap(market.amm, 'base', maxOrderFillPossible, SwapDirection.REMOVE);
-			const maxPossibleFillOrderQuoteAmount = (fillOrderNewQuoteAssetReserve.sub(market.amm.quoteAssetReserve)).mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO);
-			const maxLimitOrderFee = calculateFeeForLimitOrder(maxPossibleFillOrderQuoteAmount, clearingHouse.getStateAccount().feeStructure, clearingHouse.getOrderStateAccount().orderFillerRewardStructure, calculateOrderFeeTier(clearingHouse.getStateAccount().feeStructure), nodeToFill.order.ts, clock.unixTimestamp);
-			
-			const [, fillerRewardNewBaseAssetReserve] =  calculateAmmReservesAfterSwap(market.amm, 'quote', maxLimitOrderFee.fillerReward, SwapDirection.ADD);
-
-			const newMarket = calculateNewMarketAfterTrade((maxOrderFillPossible.add((fillerRewardNewBaseAssetReserve.mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO)))), nodeToFill.order.direction, market);
-
-			const marketPrice = convertToNumber(markPrice, MARK_PRICE_PRECISION);
-			const marketPriceAfter = convertToNumber(calculateMarkPrice(newMarket), MARK_PRICE_PRECISION);
-			const spread = Math.abs(marketPrice - marketPriceAfter);
-			const maxFillerReward = convertToNumber(maxLimitOrderFee.fillerReward, new BN(10 ** 6));
-			const maxFrontRunQuoteAmount = (maxFillerReward + (spread)) * (10 ** 6);
-
-			// console.log(convertToNumber(limitOrderFee.fillerReward, new BN(10 ** 6)), quoteSwapAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.baseAssetAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.ts.toNumber(), clock.unixTimestamp.toNumber());
-			// console.log((((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION)))).toNumber());
-			// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, ((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION))), nodeToFill.order.marketIndex));
-			// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, frontRunQuoteAmount, nodeToFill.order.marketIndex));
-			console.log(convertToNumber(nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled), BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
-			frontRun.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
-			// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
-
-			try {
-				const txSig = await clearingHouse.txSender.send(frontRun, [], clearingHouse.opts);
 				console.log(
-					`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
+					`trying to fill (account: ${nodeToFill.userAccount.toString()})`
 				);
-				console.log(`Tx: ${txSig}`);
-				cloudWatchClient.logFill(true);
-			} catch (error) {
-				nodeToFill.haveFilled = false;
-				userMap.set(nodeToFill.userAccount.toString(), {
-					user,
-					upToDate: true,
-				});
-				console.log(
-					`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
-				);
-				cloudWatchClient.logFill(false);
+				const tx = new Transaction();
+				
+				const clock = await getClock(connection);
 
-				// If we get an error that order does not exist, assume its been filled by somebody else and we
-				// have received the history record yet
-				const errorCode = getErrorCode(error);
-				if (errorCode === 6043) {
+				const maxOrderFillPossible = calculateAmountToTrade(market, nodeToFill.order);
+
+				const [fillOrderNewQuoteAssetReserve,] = calculateAmmReservesAfterSwap(market.amm, 'base', maxOrderFillPossible, SwapDirection.REMOVE);
+				const maxPossibleFillOrderQuoteAmount = (fillOrderNewQuoteAssetReserve.sub(market.amm.quoteAssetReserve)).mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO);
+				const maxLimitOrderFee = calculateFeeForLimitOrder(maxPossibleFillOrderQuoteAmount, clearingHouse.getStateAccount().feeStructure, clearingHouse.getOrderStateAccount().orderFillerRewardStructure, calculateOrderFeeTier(clearingHouse.getStateAccount().feeStructure), nodeToFill.order.ts, clock.unixTimestamp);
+				
+				const [, fillerRewardNewBaseAssetReserve] =  calculateAmmReservesAfterSwap(market.amm, 'quote', maxLimitOrderFee.fillerReward, SwapDirection.ADD);
+
+				const newMarket = calculateNewMarketAfterTrade((maxOrderFillPossible.add((fillerRewardNewBaseAssetReserve.mul(PEG_PRECISION).div(AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO)))), nodeToFill.order.direction, market);
+
+				const marketPrice = convertToNumber(markPrice, MARK_PRICE_PRECISION);
+				const marketPriceAfter = convertToNumber(calculateMarkPrice(newMarket), MARK_PRICE_PRECISION);
+				const spread = Math.abs(marketPrice - marketPriceAfter);
+				const maxFillerReward = convertToNumber(maxLimitOrderFee.fillerReward, new BN(10 ** 6));
+				const maxFrontRunQuoteAmount = (maxFillerReward + (spread)) * (10 ** 6);
+
+				// console.log(convertToNumber(limitOrderFee.fillerReward, new BN(10 ** 6)), quoteSwapAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.baseAssetAmount.div(AMM_RESERVE_PRECISION).toNumber(), nodeToFill.order.ts.toNumber(), clock.unixTimestamp.toNumber());
+				// console.log((((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION)))).toNumber());
+				// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, ((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION))), nodeToFill.order.marketIndex));
+				// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, frontRunQuoteAmount, nodeToFill.order.marketIndex));
+				console.log(convertToNumber(maxOrderFillPossible, BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
+				tx.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
+				// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
+
+				try {
+					const txSig = await clearingHouse.txSender.send(tx, [], clearingHouse.opts);
 					console.log(
-						`Order ${nodeToFill.order.orderId.toString()} not found when trying to fill. Removing from order list`
+						`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 					);
-					orderLists[nodeToFill.sortDirection].remove(
-						nodeToFill.order.orderId.toNumber()
+					console.log(`Tx: ${txSig}`);
+					cloudWatchClient.logFill(true);
+				} catch (error) {
+					nodeToFill.haveFilled = false;
+					userMap.set(nodeToFill.userAccount.toString(), {
+						user,
+						upToDate: true,
+					});
+					console.log(
+						`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 					);
-					printTopOfOrdersList(orderLists.asc, orderLists.desc);
+					cloudWatchClient.logFill(false);
+
+					// If we get an error that order does not exist, assume its been filled by somebody else and we
+					// have received the history record yet
+					const errorCode = getErrorCode(error);
+					if (errorCode === 6043) {
+						console.log(
+							`Order ${nodeToFill.order.orderId.toString()} not found when trying to fill. Removing from order list`
+						);
+						orderLists[nodeToFill.sortDirection].remove(
+							nodeToFill.order.orderId.toNumber()
+						);
+						printTopOfOrdersList(orderLists.asc, orderLists.desc);
+					}
 				}
 			}
 		}
@@ -569,6 +570,3 @@ getClock(connection).then(clock => {
 });
 
 recursiveTryCatch(() => runBot(wallet, clearingHouse));
-
-
-
