@@ -532,7 +532,7 @@ const clearingHouse = getClearingHouse(
 		connection,
 		provider.wallet,
 		clearingHousePublicKey,
-		new BulkAccountLoader(connection, 'confirmed', 500)
+		new BulkAccountLoader(connection, 'confirmed', 10000)
 	)
 );
 
