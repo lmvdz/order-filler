@@ -1,7 +1,7 @@
 import { BN, ProgramAccount, Provider } from '@project-serum/anchor';
-import * as BufferLayout from '@solana/buffer-layout';
-import { Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction } from '@solana/web3.js';
-import { u64 } from "@solana/spl-token";
+// import * as BufferLayout from '@solana/buffer-layout';
+import { Connection, Keypair, PublicKey, Transaction } from '@solana/web3.js';
+// import { u64 } from "@solana/spl-token";
 
 import {
 	BulkAccountLoader,
@@ -11,7 +11,6 @@ import {
 	Markets,
 	UserOrdersAccount,
 	OrderRecord,
-	getUserOrdersAccountPublicKey,
 	calculateMarkPrice,
 	convertToNumber,
 	MARK_PRICE_PRECISION,
@@ -100,12 +99,12 @@ function isOrderRiskIncreasing(
 	return false;
 }
 
-const calculatePositionPNL = (
+function calculatePositionPNL(
 	market: Market,
 	marketPosition: UserPosition,
     baseAssetValue: BN,
 	withFunding = false
-): BN  => {
+): BN  {
 	if (marketPosition.baseAssetAmount.eq(ZERO)) {
 		return ZERO;
 	}
@@ -120,9 +119,9 @@ const calculatePositionPNL = (
 	}
 
 	return pnlAssetAmount;
-};
+}
 
-const getMarginRatio = (clearingHouse : ClearingHouse, user: User) => {
+function getMarginRatio(clearingHouse : ClearingHouse, user: User) {
     const positions = user.positionsAccount.positions;
     
 
@@ -156,7 +155,7 @@ const getMarginRatio = (clearingHouse : ClearingHouse, user: User) => {
         user.userAccount.collateral.add(unrealizedPNL) ??
         ZERO
     ).mul(TEN_THOUSAND).div(totalPositionValue);
-};
+}
 
 
 //@ts-ignore
@@ -198,11 +197,6 @@ function getWallet(): Wallet {
 	return new Wallet(keypair);
 }
 
-const endpoint = process.env.ENDPOINT;
-const connection = new Connection(endpoint);
-
-const intervalIds = [];
-
 interface User {
 	marginRatio: BN,
 	publicKey: string,
@@ -215,123 +209,185 @@ interface User {
 }
 
 
-const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
-	const lamportsBalance = await connection.getBalance(wallet.publicKey);
-	console.log('SOL balance:', lamportsBalance / 10 ** 9);
-	await clearingHouse.subscribe(['orderHistoryAccount']);
-	console.log(clearingHouse.program.programId.toString());
+export class OrderFiller {
+	clearingHouse: ClearingHouse;
+	wallet: Wallet;
+	lamportsBalance: number;
+	marketOrderLists: Map<number, { desc: OrderList, asc: OrderList }>;
+	openOrders: Set<number>;
+	nextOrderHistoryIndex: number;
+	userMap: Map<string, User>;
+	pollingAccountSubscriber: PollingAccountSubscriber;
+	perMarketMutex: Array<number>;
+	updateOrderListMutex: number;
+	intervalIds: Array<NodeJS.Timer>;
+	running: boolean;
+	constructor(wallet: Wallet, clearingHouse: ClearingHouse) {
+		this.clearingHouse = clearingHouse;
+		
+		this.wallet = wallet;
+		this.marketOrderLists = new Map<number, { desc: OrderList, asc: OrderList }>();
+		this.openOrders = new Set<number>();
+		this.nextOrderHistoryIndex = clearingHouse.getOrderHistoryAccount().head.toNumber();
+		this.userMap = new Map<string, User>();
+		this.pollingAccountSubscriber = new PollingAccountSubscriber('pollingAccountSubscriber', this.clearingHouse.program, 0, 5000);
+		this.perMarketMutex = new Array(64).fill(0);
+		this.intervalIds = new Array<NodeJS.Timer>();
+		this.running = false;
 
-	const marketOrderLists = new Map<
-		number,
-		{ desc: OrderList; asc: OrderList }
-	>();
-	for (const market of Markets) {
-		const longs = new OrderList(market.marketIndex, 'desc');
-		const shorts = new OrderList(market.marketIndex, 'asc');
-
-		marketOrderLists.set(market.marketIndex.toNumber(), {
-			desc: longs,
-			asc: shorts,
+		Markets.forEach(market => {
+			this.marketOrderLists.set(market.marketIndex.toNumber(), {
+				desc: new OrderList(market.marketIndex, 'desc'), // longs
+				asc: new OrderList(market.marketIndex, 'asc'), // shorts
+			});
 		});
+		
+		
 	}
-	const openOrders = new Set<number>();
+	sleep(ms : number) : Promise<void> {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+	
+	async recursiveTryCatch(f: () => Promise<void>) : Promise<void> {
+		try {
+			await (f.bind(this))();
+		} catch (e) {
+			console.error(e);
+			this.intervalIds.forEach(i => clearInterval(i));
+			await this.sleep(15000);
+			await this.recursiveTryCatch(f.bind(this));
+		}
+	}
+	start () : void {
+		if (!this.running) {
+			this.running = true;
+			this.recursiveTryCatch(this.runBot.bind(this));
+		} else {
+			console.log('order filler is already running');
+		}
+		
+	}
+	stop () : void {
+		if (this.running) {
+			this.running = false;
+			this.intervalIds.forEach(i => clearInterval(i));
+		} else {
+			console.log('order filler is not running');
+		}
+		
+	}
+	async runBot () : Promise<void> {
 
-	// explicitly grab order index before we initially build order list
-	// so we're less likely to have missed records while we fetch order accounts
-	let nextOrderHistoryIndex = clearingHouse
-		.getOrderHistoryAccount()
-		.head.toNumber();
+		console.log('fetching all users');
+		await this.fetchAllUsers();
 
-	const printTopOfOrdersList = (ascList: OrderList, descList: OrderList) => {
-		console.log(`Market ${Markets[descList.marketIndex.toNumber()].symbol}`);
-		descList.printTop();
+		this.intervalIds.push(setInterval(() => {
+			this.fetchAllUsers();
+		}, 60 * 30 * 1000));
+
+		this.intervalIds.push(setInterval(() => {
+			this.userMap.forEach(async user => {
+				this.userMap.set(user.publicKey, { ...user, marginRatio: getMarginRatio(clearingHouse, user) } as User);
+			});
+		}, 500));
+
+
+		this.printOrderLists();
+
+		this.clearingHouse.eventEmitter.on('orderHistoryAccountUpdate', this.updateOrderList.bind(this));
+		await this.updateOrderList();
+
+		this.tryFill();
+		this.intervalIds.push(setInterval((this.tryFill.bind(this)), 500));
+	}
+	static async load(wallet: Wallet, clearingHouse: ClearingHouse) : Promise<OrderFiller> {
+		await clearingHouse.subscribe(['orderHistoryAccount']);
+		
+		return new OrderFiller(wallet, clearingHouse);
+	}
+	async getBalance() : Promise<number> {
+		return await this.clearingHouse.connection.getBalance(wallet.publicKey);
+	}
+	async printBalance() : Promise<void> {
+		this.lamportsBalance = await this.getBalance();
+		console.log('SOL balance:', this.lamportsBalance / 10 ** 9);
+	}
+	printTopOfOrdersList(asc: OrderList, desc: OrderList) : void {
+		console.log(`Market ${Markets[desc.marketIndex.toNumber()].symbol}`);
+		desc.printTop();
 		console.log(
 			`Mark`,
 			convertToNumber(
-				calculateMarkPrice(clearingHouse.getMarket(descList.marketIndex)),
+				calculateMarkPrice(this.clearingHouse.getMarket(desc.marketIndex)),
 				MARK_PRICE_PRECISION
 			).toFixed(3)
 		);
-		ascList.printTop();
-	};
-
-	const printOrderLists = () => {
-		for (const [_, ordersList] of marketOrderLists) {
-			printTopOfOrdersList(ordersList.asc, ordersList.desc);
-		}
-	};
-	
-
-	const updateUserOrders = (
-		user: User,
-		userAccountPublicKey: PublicKey,
-		userOrdersAccountPublicKey: PublicKey
-	): BN => {
-		const marginRatio = getMarginRatio(clearingHouse, user);
+		asc.printTop();
+	}
+	printOrderLists() : void {
+		[...this.marketOrderLists.values()].forEach(ordersList => {
+			this.printTopOfOrdersList(ordersList.asc, ordersList.desc);
+		});
+	}
+	updateUserOrders(user: User, userAccountPublicKey: PublicKey, userOrdersAccountPublicKey: PublicKey) : BN {
+		const marginRatio = getMarginRatio(this.clearingHouse, user);
 
 		const userOrdersAccount = user.ordersAccount;
 
 		if (userOrdersAccount) {
 			const tooMuchLeverage = marginRatio.lte(
-				clearingHouse.getStateAccount().marginRatioInitial
+				this.clearingHouse.getStateAccount().marginRatioInitial
 			);
 
 			userOrdersAccount.orders.forEach(async order => {
-				const ordersLists = marketOrderLists.get(order.marketIndex.toNumber());
+				const ordersLists = this.marketOrderLists.get(order.marketIndex.toNumber());
 				const orderList = ordersLists[sortDirectionForOrder(order)];
 				const orderIsRiskIncreasing = isOrderRiskIncreasing(user.positionsAccount, order);
 
 				const orderId = order.orderId.toNumber();
 				if (tooMuchLeverage && orderIsRiskIncreasing) {
-					if (openOrders.has(orderId) && orderList.has(orderId)) {
+					if (this.openOrders.has(orderId) && orderList.has(orderId)) {
 						console.log(
 							`User has too much leverage and order is risk increasing. Removing order ${order.orderId.toString()}`
 						);
 						orderList.remove(orderId);
-						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+						this.printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
 					}
 				} else if (orderIsRiskIncreasing && order.reduceOnly) {
-					if (openOrders.has(orderId) && orderList.has(orderId)) {
+					if (this.openOrders.has(orderId) && orderList.has(orderId)) {
 						console.log(
 							`Order ${order.orderId.toString()} is risk increasing but reduce only. Removing`
 						);
 						orderList.remove(orderId);
-						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+						this.printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
 					}
 				} else {
-					if (openOrders.has(orderId) && !orderList.has(orderId)) {
+					if (this.openOrders.has(orderId) && !orderList.has(orderId)) {
 						console.log(`Order ${order.orderId.toString()} added back`);
 						orderList.insert(
 							order,
 							userAccountPublicKey,
 							userOrdersAccountPublicKey
 						);
-						printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+						this.printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
 					}
 				}
 			});
 		}
 		return marginRatio;
-	};
-
-	const userMap = new Map<
-		string,
-		User
-	>();
-
-	const fetchAllUsers = async () => {
-
-		const programUserAccounts = await clearingHouse.program.account.user.all();
-		const userOrderAccounts = await clearingHouse.program.account.userOrders.all();
-		const userPositionsAccounts = await clearingHouse.program.account.userPositions.all();
+	}
+	async fetchAllUsers() : Promise<void> {
+		const programUserAccounts = await this.clearingHouse.program.account.user.all();
+		const userOrderAccounts = await this.clearingHouse.program.account.userOrders.all();
+		const userPositionsAccounts = await this.clearingHouse.program.account.userPositions.all();
 
 
-		await Promise.all(programUserAccounts.map(async (programUserAccount : ProgramAccount<UserAccount>) => {
+		programUserAccounts.forEach(async (programUserAccount : ProgramAccount<UserAccount>) => {
 			const userAccountPubkey = programUserAccount.publicKey;
 			// if the user has less than one dollar in account, disregard initially
 			// if an order comes from this user, we can add them then.
 			// This makes it so that we don't need to listen to inactive users
-			if (!programUserAccount.account.collateral.lt(QUOTE_PRECISION) && !userMap.has(userAccountPubkey.toBase58())) {
+			if (!programUserAccount.account.collateral.lt(QUOTE_PRECISION) && !this.userMap.has(userAccountPubkey.toBase58())) {
 				const userOrdersAccount = userOrderAccounts.find((x : ProgramAccount<UserOrdersAccount>) => x.account.user.toBase58() === userAccountPubkey.toBase58()) as ProgramAccount<UserOrdersAccount>;
 				if (userOrdersAccount !== undefined) {
 					const userPositionsAccount = userPositionsAccounts.find((x : ProgramAccount<UserPositionsAccount>) => x.account.user.toBase58() === userAccountPubkey.toBase58()) as ProgramAccount<UserPositionsAccount>;
@@ -348,138 +404,121 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		
 					user.ordersAccount.orders.forEach(async order => {
 						if (!isVariant(order, 'init') && !isVariant(order.orderType, 'market')) {
-							marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)].insert(order, programUserAccount.publicKey, new PublicKey(user.orders));
+							this.marketOrderLists.get(order.marketIndex.toNumber())[sortDirectionForOrder(order)].insert(order, programUserAccount.publicKey, new PublicKey(user.orders));
 						}
 			
-						const ordersList = marketOrderLists.get(order.marketIndex.toNumber());
+						const ordersList = this.marketOrderLists.get(order.marketIndex.toNumber());
 						const sortDirection = sortDirectionForOrder(order);
 						const orderList = sortDirection === 'desc' ? ordersList.desc : ordersList.asc;
 						orderList.insert(order, programUserAccount.publicKey, userOrdersAccount.publicKey);
 						if (isVariant(order.status, 'open')) {
-							openOrders.add(order.orderId.toNumber());
+							this.openOrders.add(order.orderId.toNumber());
 						}
 					});
 		
-					userMap.set( userAccountPubkey.toBase58(), user );
+					this.userMap.set( userAccountPubkey.toBase58(), user );
 		
-					pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'user', user.publicKey, (data: UserAccount) => {
+					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'user', user.publicKey, (data: UserAccount) => {
 		
-						const newData = { ...userMap.get(user.publicKey), accountData: data } as User;
-						userMap.set(user.publicKey, newData);
+						const newData = { ...this.userMap.get(user.publicKey), accountData: data } as User;
+						this.userMap.set(user.publicKey, newData);
 		
 					});
 			
-					pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userPositions', user.positions, (data: UserPositionsAccount) => {
+					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userPositions', user.positions, (data: UserPositionsAccount) => {
 		
-						const newData = { ...userMap.get(user.publicKey), positionsAccount: data } as User;
-						newData.marginRatio = updateUserOrders(user, new PublicKey(user.publicKey), new PublicKey(user.orders));
+						const newData = { ...this.userMap.get(user.publicKey), positionsAccount: data } as User;
+						newData.marginRatio = this.updateUserOrders(user, new PublicKey(user.publicKey), new PublicKey(user.orders));
 						
-						userMap.set(user.publicKey, newData);
+						this.userMap.set(user.publicKey, newData);
 		
 					});
 			
-					pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userOrders', user.orders, (data: UserOrdersAccount) => {
+					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userOrders', user.orders, (data: UserOrdersAccount) => {
 		
-						const newData = { ...userMap.get(user.publicKey), ordersAccount: data } as User;
-						newData.marginRatio = getMarginRatio(clearingHouse, newData);
-						userMap.set(user.publicKey, newData);
+						const newData = { ...this.userMap.get(user.publicKey), ordersAccount: data } as User;
+						newData.marginRatio = this.updateUserOrders(user, new PublicKey(user.publicKey), new PublicKey(user.orders));
+						this.userMap.set(user.publicKey, newData);
 		
 					});
 				}
 				
 			}
-		}));
-		if (!pollingAccountSubscriber.isSubscribed) {
-			pollingAccountSubscriber.subscribe();
-		}
-
-	};
-	console.log('fetching all users');
-	await fetchAllUsers();
-
-	setInterval(() => {
-		fetchAllUsers();
-	}, 30 * 1000);
-
-	printOrderLists();
-
-	setInterval(() => {
-		userMap.forEach(async user => {
-			userMap.set(user.publicKey, { ...user, marginRatio: getMarginRatio(clearingHouse, user) });
 		});
-	}, 1500);
-	
-
-	let updateOrderListMutex = 0;
-	const handleOrderRecord = async (record: OrderRecord) => {
-		const order = record.order;
-		// Disregard market orders
-		if (isVariant(order.orderType, 'market')) {
-			return;
+		if (!this.pollingAccountSubscriber.isSubscribed) {
+			this.pollingAccountSubscriber.subscribe();
 		}
-
-		const ordersList = marketOrderLists.get(order.marketIndex.toNumber());
-		const orderList = ordersList[sortDirectionForOrder(order)];
-
-		if (isVariant(record.action, 'place')) {
-			const userOrdersAccountPublicKey = await getUserOrdersAccountPublicKey(
-				clearingHouse.program.programId,
-				record.user
-			);
-			orderList.insert(order, record.user, userOrdersAccountPublicKey);
-			openOrders.add(order.orderId.toNumber());
-			console.log(
-				`Order ${order.orderId.toString()} placed. Added to order list`
-			);
-		} else if (isVariant(record.action, 'cancel')) {
-			orderList.remove(order.orderId.toNumber());
-			openOrders.delete(order.orderId.toNumber());
-			console.log(
-				`Order ${order.orderId.toString()} canceled. Removed from order list`
-			);
-		} else if (isVariant(record.action, 'fill')) {
-			if (order.baseAssetAmount.eq(order.baseAssetAmountFilled)) {
-				orderList.remove(order.orderId.toNumber());
-				openOrders.delete(order.orderId.toNumber());
-				console.log(
-					`Order ${order.orderId.toString()} completely filled. Removed from order list`
-				);
-			} else {
-				orderList.update(order);
-				console.log(
-					`Order ${order.orderId.toString()} partially filled. Updated`
-				);
+	}
+	async handleOrderRecord(record: OrderRecord) : Promise<void> {
+		if (record !== undefined) {
+			const order = record.order;
+			// Disregard market orders
+			if (isVariant(order.orderType, 'market')) {
+				return;
 			}
-		}
-		printTopOfOrdersList(ordersList.asc, ordersList.desc);
-	};
 
-	const updateOrderList = async () => {
-		if (updateOrderListMutex === 1) {
+			const ordersList = this.marketOrderLists.get(order.marketIndex.toNumber());
+			const orderList = ordersList[sortDirectionForOrder(order)];
+
+			if (isVariant(record.action, 'place')) {
+				// const userOrdersAccountPublicKey = await getUserOrdersAccountPublicKey(
+				// 	this.clearingHouse.program.programId,
+				// 	record.user
+				// );
+				const user = [...this.userMap.values()].find(u => u.publicKey === record.user.toBase58());
+				orderList.insert(order, record.user, new PublicKey(user.orders));
+				this.openOrders.add(order.orderId.toNumber());
+				console.log(
+					`Order ${order.orderId.toString()} placed. Added to order list`
+				);
+			} else if (isVariant(record.action, 'cancel')) {
+				orderList.remove(order.orderId.toNumber());
+				this.openOrders.delete(order.orderId.toNumber());
+				console.log(
+					`Order ${order.orderId.toString()} canceled. Removed from order list`
+				);
+			} else if (isVariant(record.action, 'fill')) {
+				if (order.baseAssetAmount.eq(order.baseAssetAmountFilled)) {
+					orderList.remove(order.orderId.toNumber());
+					this.openOrders.delete(order.orderId.toNumber());
+					console.log(
+						`Order ${order.orderId.toString()} completely filled. Removed from order list`
+					);
+				} else {
+					orderList.update(order);
+					console.log(
+						`Order ${order.orderId.toString()} partially filled. Updated`
+					);
+				}
+			}
+			this.printTopOfOrdersList(ordersList.asc, ordersList.desc);
+		}
+		
+		
+	}
+
+	async updateOrderList() : Promise<void> {
+		if (this.updateOrderListMutex === 1) {
 			return;
 		}
-		updateOrderListMutex = 1;
+		this.updateOrderListMutex = 1;
 
 		let head = clearingHouse.getOrderHistoryAccount().head.toNumber();
-		while (nextOrderHistoryIndex !== head) {
+		while (this.nextOrderHistoryIndex !== head) {
 			const nextRecord =
 				clearingHouse.getOrderHistoryAccount().orderRecords[
-					nextOrderHistoryIndex
+					this.nextOrderHistoryIndex
 				];
-			await handleOrderRecord(nextRecord);
-			nextOrderHistoryIndex += 1;
+			await this.handleOrderRecord(nextRecord);
+			this.nextOrderHistoryIndex++;
 			head = clearingHouse.getOrderHistoryAccount().head.toNumber();
 		}
-		updateOrderListMutex = 0;
-	};
-
-	clearingHouse.eventEmitter.on('orderHistoryAccountUpdate', updateOrderList);
-	await updateOrderList();
-
-	const findNodesToFill = async (
+		this.updateOrderListMutex = 0;
+	}
+	async findNodesToFill(
 		node: Node,
 		markPrice: BN
-	): Promise<Node[]> => {
+	): Promise<Node[]> {
 		const nodesToFill = [];
 		let currentNode = node;
 		while (currentNode !== undefined) {
@@ -488,7 +527,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				break;
 			}
 
-			const mapValue = userMap.get(node.userAccount.toString());
+			const mapValue = this.userMap.get(node.userAccount.toString());
 			if (mapValue) {
 				if (!currentNode.haveFilled && mapValue.upToDate) {
 					nodesToFill.push(currentNode);
@@ -499,36 +538,34 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 		}
 
 		return nodesToFill;
-	};
-
-	const perMarketMutex = Array(64).fill(0);
-	const tryFillForMarket = async (marketIndex: BN) => {
-		if (perMarketMutex[marketIndex.toNumber()] === 1) {
+	}
+	async tryFillForMarket(marketIndex: BN) : Promise<void> {
+		if (this.perMarketMutex[marketIndex.toNumber()] === 1) {
 			return;
 		}
-		perMarketMutex[marketIndex.toNumber()] = 1;
+		this.perMarketMutex[marketIndex.toNumber()] = 1;
 
-		const market = clearingHouse.getMarket(marketIndex);
-		const orderLists = marketOrderLists.get(marketIndex.toNumber());
+		const market = this.clearingHouse.getMarket(marketIndex);
+		const orderLists = this.marketOrderLists.get(marketIndex.toNumber());
 		const markPrice = calculateMarkPrice(market);
 
 		const nodesToFill: Node[] = [];
 		if (orderLists.asc.head && orderLists.asc.head.pricesCross(markPrice)) {
 			nodesToFill.push(
-				...(await findNodesToFill(orderLists.asc.head, markPrice))
+				...(await this.findNodesToFill(orderLists.asc.head, markPrice))
 			);
 		}
 
 		if (orderLists.desc.head && orderLists.desc.head.pricesCross(markPrice)) {
 			nodesToFill.push(
-				...(await findNodesToFill(orderLists.desc.head, markPrice))
+				...(await this.findNodesToFill(orderLists.desc.head, markPrice))
 			);
 		}
 
 		nodesToFill
 			.filter((nodeToFill) => !nodeToFill.haveFilled)
 			.forEach(async (nodeToFill) => {
-				userMap.set(nodeToFill.userAccount.toString(), { ...userMap.get(nodeToFill.userAccount.toString()), upToDate: false });
+				this.userMap.set(nodeToFill.userAccount.toString(), { ...this.userMap.get(nodeToFill.userAccount.toString()), upToDate: false });
 				nodeToFill.haveFilled = true;
 
 				console.log(
@@ -560,11 +597,11 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 				// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, ((nodeToFill.order.baseAssetAmount.sub(nodeToFill.order.baseAssetAmountFilled)).div(new BN(10 ** 7))).mul(new BN(convertToNumber(markPrice, MARK_PRICE_PRECISION))), nodeToFill.order.marketIndex));
 				// frontRun.add(await clearingHouse.getOpenPositionIx(nodeToFill.order.direction, frontRunQuoteAmount, nodeToFill.order.marketIndex));
 				// console.log(convertToNumber(maxOrderFillPossible, BASE_PRECISION), spread, maxFillerReward, marketPrice, marketPriceAfter, maxFrontRunQuoteAmount);
-				tx.add(await clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
+				tx.add(await this.clearingHouse.getFillOrderIx(nodeToFill.userAccount, nodeToFill.userOrdersAccount, nodeToFill.order));
 				
 				// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
 				try {
-					const txSig = await clearingHouse.txSender.send(tx, [], clearingHouse.opts);
+					const txSig = await this.clearingHouse.txSender.send(tx, [], clearingHouse.opts);
 					console.log(
 						`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 					);
@@ -572,7 +609,7 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 					cloudWatchClient.logFill(true);
 				} catch(error) {
 					nodeToFill.haveFilled = false;
-					userMap.set(nodeToFill.userAccount.toString(), { ...userMap.get(nodeToFill.userAccount.toString()), upToDate: true });
+					this.userMap.set(nodeToFill.userAccount.toString(), { ...this.userMap.get(nodeToFill.userAccount.toString()), upToDate: true });
 					console.log(
 						`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 					);
@@ -588,41 +625,23 @@ const runBot = async (wallet: Wallet, clearingHouse: ClearingHouse) => {
 						orderLists[nodeToFill.sortDirection].remove(
 							nodeToFill.order.orderId.toNumber()
 						);
-						printTopOfOrdersList(orderLists.asc, orderLists.desc);
+						this.printTopOfOrdersList(orderLists.asc, orderLists.desc);
 					}
 				}
 			});
-		perMarketMutex[marketIndex.toNumber()] = 0;
-	};
-
-	const tryFill = () => {
+			this.perMarketMutex[marketIndex.toNumber()] = 0;
+	}
+	tryFill() : void {
 		Markets.forEach(async market => {
-			tryFillForMarket(market.marketIndex);
+			this.tryFillForMarket(market.marketIndex);
 		});
-	};
-
-	tryFill();
-	const handleFillIntervalId = setInterval(tryFill, 500); // every half second
-	intervalIds.push(handleFillIntervalId);
-};
-
-async function recursiveTryCatch(f: () => void) {
-	function sleep(ms) {
-		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	try {
-		await f();
-	} catch (e) {
-		console.error(e);
-		for (const intervalId of intervalIds) {
-			clearInterval(intervalId);
-		}
-		await sleep(15000);
-		await recursiveTryCatch(f);
-	}
 }
 
+
+const endpoint = process.env.ENDPOINT;
+const connection = new Connection(endpoint);
 const wallet = getWallet();
 const provider = new Provider(connection, wallet, Provider.defaultOptions());
 const clearingHousePublicKey = new PublicKey(
@@ -631,62 +650,70 @@ const clearingHousePublicKey = new PublicKey(
 
 const clearingHouse = getClearingHouse(
 	getPollingClearingHouseConfig(
-		connection,
+		provider.connection,
 		provider.wallet,
 		clearingHousePublicKey,
-		new BulkAccountLoader(connection, 'confirmed', 500)
+		new BulkAccountLoader(provider.connection, 'confirmed', 500)
 	)
 );
 
-const pollingAccountSubscriber = new PollingAccountSubscriber('main', clearingHouse.program, 0, 5000);
 
-const uint64 = (property = "uint64") => {
-    return BufferLayout.blob(8, property);
-};
+setInterval(() => {
+	console.log(`total mem usage: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`);
+}, 10 * 1000);
 
-function uint8ToU64(data) {
-    return new u64(data, 10, "le");
-}
-
-
-const CLOCK_LAYOUT = BufferLayout.struct([
-	uint64('slot'),
-	uint64('epochStartTimestamp'),
-	uint64('epoch'),
-	uint64('leaderScheduleEpoch'),
-	uint64('unixTimestamp')
-
-]);
-
-interface Clock {
-	slot: u64,
-	epochStartTimestamp: u64,
-	epoch: u64,
-	leaderScheduleEpoch: u64,
-	unixTimestamp: u64
-}
-
-const getClock = ( connection: Connection ) : Promise<Clock> => {
-	return new Promise((resolve, reject) => {
-		connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, 'processed').then(clockAccountInfo => {
-			const decoded = CLOCK_LAYOUT.decode(Uint8Array.from(clockAccountInfo.data));
-			resolve({
-				slot: uint8ToU64(decoded.slot),
-				epochStartTimestamp: uint8ToU64(decoded.epochStartTimestamp),
-				epoch: uint8ToU64(decoded.epoch),
-				leaderScheduleEpoch: uint8ToU64(decoded.leaderScheduleEpoch),
-				unixTimestamp: uint8ToU64(decoded.unixTimestamp),
-			} as Clock);
-		}).catch(error => {
-			reject(error);
-		});
-	});
-};
-
-getClock(connection).then(clock => {
-	console.log(clock.unixTimestamp.toNumber());
-}).catch(error => {
-	console.error(error);
+OrderFiller.load(wallet, clearingHouse).then((orderFiller) => {
+	orderFiller.start();
 });
 
-recursiveTryCatch(() => runBot(wallet, clearingHouse));
+// const pollingAccountSubscriber = new PollingAccountSubscriber('pollingAccountSubscriber', clearingHouse.program, 0, 5000);
+
+// const uint64 = (property = "uint64") => {
+//     return BufferLayout.blob(8, property);
+// };
+
+// function uint8ToU64(data) {
+//     return new u64(data, 10, "le");
+// }
+
+
+// const CLOCK_LAYOUT = BufferLayout.struct([
+// 	uint64('slot'),
+// 	uint64('epochStartTimestamp'),
+// 	uint64('epoch'),
+// 	uint64('leaderScheduleEpoch'),
+// 	uint64('unixTimestamp')
+
+// ]);
+
+// interface Clock {
+// 	slot: u64,
+// 	epochStartTimestamp: u64,
+// 	epoch: u64,
+// 	leaderScheduleEpoch: u64,
+// 	unixTimestamp: u64
+// }
+
+// const getClock = ( connection: Connection ) : Promise<Clock> => {
+// 	return new Promise((resolve, reject) => {
+// 		connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, 'processed').then(clockAccountInfo => {
+// 			const decoded = CLOCK_LAYOUT.decode(Uint8Array.from(clockAccountInfo.data));
+// 			resolve({
+// 				slot: uint8ToU64(decoded.slot),
+// 				epochStartTimestamp: uint8ToU64(decoded.epochStartTimestamp),
+// 				epoch: uint8ToU64(decoded.epoch),
+// 				leaderScheduleEpoch: uint8ToU64(decoded.leaderScheduleEpoch),
+// 				unixTimestamp: uint8ToU64(decoded.unixTimestamp),
+// 			} as Clock);
+// 		}).catch(error => {
+// 			reject(error);
+// 		});
+// 	});
+// };
+
+// getClock(connection).then(clock => {
+// 	console.log(clock.unixTimestamp.toNumber());
+// }).catch(error => {
+// 	console.error(error);
+// });
+
