@@ -1,6 +1,8 @@
+"use strict";
+
 import { BN, ProgramAccount, Provider } from '@project-serum/anchor';
 // import * as BufferLayout from '@solana/buffer-layout';
-import { Connection, Keypair, PublicKey, Transaction } from '@solana/web3.js';
+import { Keypair, PublicKey, Transaction } from '@solana/web3.js';
 // import { u64 } from "@solana/spl-token";
 
 import {
@@ -39,9 +41,10 @@ import {
 	BN_MAX,
 	calculateBaseAssetValue,
 	Order,
-	TWO,
-	PollingAccountSubscriber
+	TWO
 } from '@drift-labs/sdk';
+import { PollingAccountsFetcher } from 'polling-account-fetcher';
+import { TpuConnection } from 'tpu-client';
 
 import { Node, OrderList, sortDirectionForOrder } from './OrderList';
 import { CloudWatchClient } from './cloudWatchClient';
@@ -206,31 +209,40 @@ interface User {
 	positionsAccount: UserPositionsAccount
 	ordersAccount: UserOrdersAccount,
 	upToDate: boolean
+	authority: string
 }
 
+interface UnconfirmedTransaction {
+	tx: string,
+	timestamp: number
+}
 
 export class OrderFiller {
 	clearingHouse: ClearingHouse;
+	connection: TpuConnection;
 	wallet: Wallet;
 	lamportsBalance: number;
 	marketOrderLists: Map<number, { desc: OrderList, asc: OrderList }>;
 	openOrders: Set<number>;
 	nextOrderHistoryIndex: number;
 	userMap: Map<string, User>;
-	pollingAccountSubscriber: PollingAccountSubscriber;
+	pollingAccountSubscriber: PollingAccountsFetcher;
 	perMarketMutex: Array<number>;
 	updateOrderListMutex: number;
 	intervalIds: Array<NodeJS.Timer>;
 	running: boolean;
-	constructor(wallet: Wallet, clearingHouse: ClearingHouse) {
+	blacklist: Array<string> = [];
+	blockhash: string
+	transactions: Map<string, UnconfirmedTransaction> = new Map<string, UnconfirmedTransaction>();
+	constructor(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection) {
 		this.clearingHouse = clearingHouse;
-		
+		this.connection = connection;
 		this.wallet = wallet;
 		this.marketOrderLists = new Map<number, { desc: OrderList, asc: OrderList }>();
 		this.openOrders = new Set<number>();
 		this.nextOrderHistoryIndex = clearingHouse.getOrderHistoryAccount().head.toNumber();
 		this.userMap = new Map<string, User>();
-		this.pollingAccountSubscriber = new PollingAccountSubscriber('pollingAccountSubscriber', this.clearingHouse.program, 0, 5000);
+		this.pollingAccountSubscriber = new PollingAccountsFetcher(process.env.ENDPOINT, 5000);
 		this.perMarketMutex = new Array(64).fill(0);
 		this.intervalIds = new Array<NodeJS.Timer>();
 		this.running = false;
@@ -287,10 +299,13 @@ export class OrderFiller {
 
 		this.intervalIds.push(setInterval(() => {
 			this.userMap.forEach(async user => {
-				this.userMap.set(user.publicKey, { ...user, marginRatio: getMarginRatio(clearingHouse, user) } as User);
+				this.userMap.set(user.publicKey, { ...user, marginRatio: getMarginRatio(this.clearingHouse, user) } as User);
 			});
 		}, 500));
 
+		this.intervalIds.push(setInterval(async () => {
+			this.blockhash = (await this.clearingHouse.connection.getRecentBlockhash()).blockhash;
+		}, 1000));
 
 		this.printOrderLists();
 
@@ -299,14 +314,27 @@ export class OrderFiller {
 
 		this.tryFill();
 		this.intervalIds.push(setInterval((this.tryFill.bind(this)), 500));
+
+		this.intervalIds.push(setInterval((async () => {
+			this.transactions.forEach(async (unconfirmedTransaction, key) => {
+				if ((unconfirmedTransaction.timestamp + 30 * 1000) < Date.now()) {
+					const confirmation = await this.connection.confirmTransaction(unconfirmedTransaction.tx);
+					if(!confirmation.value.err) {
+						this.transactions.delete(key);
+					} else {
+						console.log('https://solscan.io/tx/'+unconfirmedTransaction.tx);
+					}
+				}
+			});
+		}), 30 * 1000));
 	}
-	static async load(wallet: Wallet, clearingHouse: ClearingHouse) : Promise<OrderFiller> {
+	static async load(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection) : Promise<OrderFiller> {
 		await clearingHouse.subscribe(['orderHistoryAccount']);
 		
-		return new OrderFiller(wallet, clearingHouse);
+		return new OrderFiller(wallet, clearingHouse, connection);
 	}
 	async getBalance() : Promise<number> {
-		return await this.clearingHouse.connection.getBalance(wallet.publicKey);
+		return await this.clearingHouse.connection.getBalance(this.wallet.publicKey);
 	}
 	async printBalance() : Promise<void> {
 		this.lamportsBalance = await this.getBalance();
@@ -361,6 +389,14 @@ export class OrderFiller {
 						orderList.remove(orderId);
 						this.printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
 					}
+				} else if (user.userAccount.collateral.eq(ZERO)) {
+					if (this.openOrders.has(orderId) && orderList.has(orderId)) {
+						console.log(
+							`Removing order ${order.orderId.toString()} as authority ${user.authority} has no collateral`
+						);
+						orderList.remove(orderId);
+						this.printTopOfOrdersList(ordersLists.asc, ordersLists.desc);
+					}
 				} else {
 					if (this.openOrders.has(orderId) && !orderList.has(orderId)) {
 						console.log(`Order ${order.orderId.toString()} added back`);
@@ -387,12 +423,13 @@ export class OrderFiller {
 			// if the user has less than one dollar in account, disregard initially
 			// if an order comes from this user, we can add them then.
 			// This makes it so that we don't need to listen to inactive users
-			if (!programUserAccount.account.collateral.lt(QUOTE_PRECISION) && !this.userMap.has(userAccountPubkey.toBase58())) {
+			if (!this.blacklist.includes(userAccountPubkey.toBase58()) && !programUserAccount.account.collateral.lt(QUOTE_PRECISION) && !this.userMap.has(userAccountPubkey.toBase58())) {
 				const userOrdersAccount = userOrderAccounts.find((x : ProgramAccount<UserOrdersAccount>) => x.account.user.toBase58() === userAccountPubkey.toBase58()) as ProgramAccount<UserOrdersAccount>;
 				if (userOrdersAccount !== undefined) {
 					const userPositionsAccount = userPositionsAccounts.find((x : ProgramAccount<UserPositionsAccount>) => x.account.user.toBase58() === userAccountPubkey.toBase58()) as ProgramAccount<UserPositionsAccount>;
 
 					const user = {
+						authority: programUserAccount.account.authority.toBase58(),
 						publicKey: userAccountPubkey.toBase58(),
 						orders: userOrdersAccount.publicKey.toBase58(),
 						positions: userPositionsAccount.publicKey.toBase58(),
@@ -418,36 +455,40 @@ export class OrderFiller {
 		
 					this.userMap.set( userAccountPubkey.toBase58(), user );
 		
-					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'user', user.publicKey, (data: UserAccount) => {
+					this.pollingAccountSubscriber.addProgram('user', user.publicKey, this.clearingHouse.program as any, (data: UserAccount) => {
 		
 						const newData = { ...this.userMap.get(user.publicKey), accountData: data } as User;
 						this.userMap.set(user.publicKey, newData);
 		
+					}, (error: any) => {
+						console.error(error);
 					});
 			
-					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userPositions', user.positions, (data: UserPositionsAccount) => {
+					this.pollingAccountSubscriber.addProgram('userPositions', user.positions, this.clearingHouse.program as any,  (data: UserPositionsAccount) => {
 		
 						const newData = { ...this.userMap.get(user.publicKey), positionsAccount: data } as User;
 						newData.marginRatio = this.updateUserOrders(user, new PublicKey(user.publicKey), new PublicKey(user.orders));
 						
 						this.userMap.set(user.publicKey, newData);
 		
+					}, (error: any) => {
+						console.error(error);
 					});
 			
-					this.pollingAccountSubscriber.addAccountToPoll(user.publicKey, 'userOrders', user.orders, (data: UserOrdersAccount) => {
+					this.pollingAccountSubscriber.addProgram('userOrders', user.orders, this.clearingHouse.program as any,  (data: UserOrdersAccount) => {
 		
 						const newData = { ...this.userMap.get(user.publicKey), ordersAccount: data } as User;
 						newData.marginRatio = this.updateUserOrders(user, new PublicKey(user.publicKey), new PublicKey(user.orders));
 						this.userMap.set(user.publicKey, newData);
 		
+					}, (error: any) => {
+						console.error(error);
 					});
 				}
 				
 			}
 		});
-		if (!this.pollingAccountSubscriber.isSubscribed) {
-			this.pollingAccountSubscriber.subscribe();
-		}
+		this.pollingAccountSubscriber.start();
 	}
 	async handleOrderRecord(record: OrderRecord) : Promise<void> {
 		if (record !== undefined) {
@@ -503,15 +544,16 @@ export class OrderFiller {
 		}
 		this.updateOrderListMutex = 1;
 
-		let head = clearingHouse.getOrderHistoryAccount().head.toNumber();
+		let head = this.clearingHouse.getOrderHistoryAccount().head.toNumber();
+		const orderHistoryLength = this.clearingHouse.getOrderHistoryAccount().orderRecords.length;
 		while (this.nextOrderHistoryIndex !== head) {
 			const nextRecord =
-				clearingHouse.getOrderHistoryAccount().orderRecords[
+			this.clearingHouse.getOrderHistoryAccount().orderRecords[
 					this.nextOrderHistoryIndex
 				];
 			await this.handleOrderRecord(nextRecord);
-			this.nextOrderHistoryIndex++;
-			head = clearingHouse.getOrderHistoryAccount().head.toNumber();
+			this.nextOrderHistoryIndex += (1 % orderHistoryLength);
+			head = this.clearingHouse.getOrderHistoryAccount().head.toNumber();
 		}
 		this.updateOrderListMutex = 0;
 	}
@@ -572,7 +614,7 @@ export class OrderFiller {
 					`trying to fill (account: ${nodeToFill.userAccount.toString()})`
 				);
 
-				const tx = new Transaction();
+				let tx = new Transaction();
 				
 				// const clock = await getClock(connection);
 
@@ -601,11 +643,11 @@ export class OrderFiller {
 				
 				// frontRun.add(await clearingHouse.getClosePositionIx(nodeToFill.order.marketIndex));
 				try {
-					const txSig = await this.clearingHouse.txSender.send(tx, [], clearingHouse.opts);
-					console.log(
-						`Filled user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
-					);
-					console.log(`Tx: ${txSig}`);
+					tx.recentBlockhash = this.blockhash;
+					tx.feePayer = this.wallet.publicKey;
+					tx = await this.clearingHouse.wallet.signTransaction(tx);
+					const txSig = await this.connection.sendRawTransaction(tx.serialize());
+					this.transactions.set(txSig, { tx: txSig, timestamp: Date.now() } as UnconfirmedTransaction);
 					cloudWatchClient.logFill(true);
 				} catch(error) {
 					nodeToFill.haveFilled = false;
@@ -626,6 +668,8 @@ export class OrderFiller {
 							nodeToFill.order.orderId.toNumber()
 						);
 						this.printTopOfOrdersList(orderLists.asc, orderLists.desc);
+					} else if (errorCode === 6046) {
+						console.log(`Order ${nodeToFill.order.orderId.toString()} -- ReduceOnlyOrderIncreasedRisk`);
 					}
 				}
 			});
@@ -640,31 +684,50 @@ export class OrderFiller {
 }
 
 
-const endpoint = process.env.ENDPOINT;
-const connection = new Connection(endpoint);
-const wallet = getWallet();
-const provider = new Provider(connection, wallet, Provider.defaultOptions());
-const clearingHousePublicKey = new PublicKey(
-	sdkConfig.CLEARING_HOUSE_PROGRAM_ID
-);
-
-const clearingHouse = getClearingHouse(
-	getPollingClearingHouseConfig(
-		provider.connection,
-		provider.wallet,
-		clearingHousePublicKey,
-		new BulkAccountLoader(provider.connection, 'confirmed', 500)
-	)
-);
-
-
 setInterval(() => {
 	console.log(`total mem usage: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`);
 }, 10 * 1000);
 
-OrderFiller.load(wallet, clearingHouse).then((orderFiller) => {
+function memoryRestart(orderFiller: OrderFiller) {
+	setTimeout(() => {
+		if ((process.memoryUsage().heapUsed / 1024 / 1024) > 3000) {
+			orderFiller.stop();
+			orderFiller = undefined;
+			main();
+		} else {
+			memoryRestart(orderFiller);
+		}
+	}, 60 * 1000);
+}
+
+async function main() {
+
+	const endpoint = process.env.ENDPOINT;
+	const connection = await TpuConnection.load(endpoint);
+	const wallet = getWallet();
+	const provider = new Provider(connection, wallet, Provider.defaultOptions());
+	const clearingHousePublicKey = new PublicKey(
+		sdkConfig.CLEARING_HOUSE_PROGRAM_ID
+	);
+
+	const clearingHouse = getClearingHouse(
+		getPollingClearingHouseConfig(
+
+			provider.connection,
+			provider.wallet,
+			clearingHousePublicKey,
+			new BulkAccountLoader(provider.connection, 'confirmed', 500)
+
+		)
+	);
+
+	const orderFiller = await OrderFiller.load(wallet, clearingHouse, connection);
 	orderFiller.start();
-});
+
+	memoryRestart(orderFiller);
+}
+
+main();
 
 // const pollingAccountSubscriber = new PollingAccountSubscriber('pollingAccountSubscriber', clearingHouse.program, 0, 5000);
 
