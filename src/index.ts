@@ -319,18 +319,22 @@ export class OrderFiller {
 			[...this.transactions.keys()].forEach(async (key, index) => {
 				setTimeout(async () => {
 					const unconfirmedTransaction = this.transactions.get(key);
-					if ((unconfirmedTransaction.timestamp + 30 * 1000) < Date.now()) {
-						try {
-							const confirmation = await this.connection.confirmTransaction(unconfirmedTransaction.tx);
-							if(confirmation.value.err) {
-								this.transactions.delete(key);
-							} else {
-								console.log('https://solscan.io/tx/'+unconfirmedTransaction.tx);
+					if (unconfirmedTransaction) {
+						if ((unconfirmedTransaction.timestamp + 30 * 1000) < Date.now()) {
+							try {
+								const confirmation = await this.connection.confirmTransaction(unconfirmedTransaction.tx);
+								if(confirmation.value.err) {
+									this.transactions.delete(key);
+								} else {
+									console.log('https://solscan.io/tx/'+unconfirmedTransaction.tx);
+								}
+								
+							} catch(error) {
+								console.error(error);
 							}
-							
-						} catch(error) {
-							console.error(error);
+							this.transactions.delete(key);
 						}
+					} else {
 						this.transactions.delete(key);
 					}
 				}, index * 1000);
