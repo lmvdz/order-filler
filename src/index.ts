@@ -316,15 +316,24 @@ export class OrderFiller {
 		this.intervalIds.push(setInterval((this.tryFill.bind(this)), 500));
 
 		this.intervalIds.push(setInterval((async () => {
-			this.transactions.forEach(async (unconfirmedTransaction, key) => {
-				if ((unconfirmedTransaction.timestamp + 30 * 1000) < Date.now()) {
-					const confirmation = await this.connection.confirmTransaction(unconfirmedTransaction.tx);
-					if(!confirmation.value.err) {
+			[...this.transactions.keys()].forEach(async (key, index) => {
+				setTimeout(async () => {
+					const unconfirmedTransaction = this.transactions.get(key);
+					if ((unconfirmedTransaction.timestamp + 30 * 1000) < Date.now()) {
+						try {
+							const confirmation = await this.connection.confirmTransaction(unconfirmedTransaction.tx);
+							if(confirmation.value.err) {
+								this.transactions.delete(key);
+							} else {
+								console.log('https://solscan.io/tx/'+unconfirmedTransaction.tx);
+							}
+							
+						} catch(error) {
+							console.error(error);
+						}
 						this.transactions.delete(key);
-					} else {
-						console.log('https://solscan.io/tx/'+unconfirmedTransaction.tx);
 					}
-				}
+				}, index * 1000);
 			});
 		}), 30 * 1000));
 	}
