@@ -41,7 +41,8 @@ import {
 	BN_MAX,
 	calculateBaseAssetValue,
 	Order,
-	TWO
+	TWO,
+	MARGIN_PRECISION
 } from '@drift-labs/sdk';
 import { PollingAccountsFetcher } from 'polling-account-fetcher';
 import { TpuConnection } from 'tpu-client';
@@ -124,40 +125,52 @@ function calculatePositionPNL(
 	return pnlAssetAmount;
 }
 
-function getMarginRatio(clearingHouse : ClearingHouse, user: User) {
-    const positions = user.positionsAccount.positions;
-    
+interface LiquidationMath {
+    totalPositionValue: BN, 
+    unrealizedPNL: BN, 
+    marginRatio: BN, 
+    partialMarginRequirement: BN,
+    totalCollateral: BN
 
-    if (positions.length === 0) {
-        return BN_MAX;
-    }
+}
 
-    let totalPositionValue = ZERO, unrealizedPNL = ZERO;
+function getLiquidationMath( clearingHouse: ClearingHouse, user: User ) : LiquidationMath {
+	const positions = user.positionsAccount.positions;
+	
+	if (positions.length === 0) {
+		return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+	}
 
-    positions.forEach(position => {
-        const market = clearingHouse.getMarket(position.marketIndex);
-        if (market !== undefined) {
-            const baseAssetAmountValue = calculateBaseAssetValue(market, position);
-            totalPositionValue = totalPositionValue.add(baseAssetAmountValue);
-            unrealizedPNL = unrealizedPNL.add(calculatePositionPNL(market, position, baseAssetAmountValue, true));
-        } else {
-            console.log(user.userAccount.positions.toBase58(), user.publicKey);
-            console.log(market, position.marketIndex.toString());
-            console.log('market undefined', market);
-        }
-        
-    });
+	let totalPositionValue = ZERO, unrealizedPNL = ZERO, partialMarginRequirement = ZERO;
 
-    // unrealizedPnLMap.set(user.publicKey, unrealizedPNL.toString());
+	positions.forEach(position => {
+		const market = clearingHouse.getMarketsAccount().markets[position.marketIndex.toNumber()];
+		if (market !== undefined) {
+			const baseAssetAmountValue = calculateBaseAssetValue(market, position);
+			const marginRequirement = baseAssetAmountValue.mul(new BN(market.marginRatioPartial)).div(MARGIN_PRECISION);
+			partialMarginRequirement = partialMarginRequirement.add(marginRequirement);
+			totalPositionValue = totalPositionValue.add(baseAssetAmountValue);
+			unrealizedPNL = unrealizedPNL.add(this.calculatePositionPNL(market, position, baseAssetAmountValue, true));
+		} else {
+			console.log(user.userAccount.positions.toBase58(), user.publicKey);
+			console.log(market, position.marketIndex.toString());
+			console.log('market undefined', market);
+		}
+		
+	});
 
-    if (totalPositionValue.eq(ZERO)) {
-        return BN_MAX;
-    }
+	// unrealizedPnLMap.set(user.publicKey, unrealizedPNL.toString());
 
-    return (
-        user.userAccount.collateral.add(unrealizedPNL) ??
-        ZERO
-    ).mul(TEN_THOUSAND).div(totalPositionValue);
+	if (totalPositionValue.eq(ZERO)) {
+		return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+	}
+	const totalCollateral = (
+		user.userAccount.collateral.add(unrealizedPNL) ??
+		ZERO
+	);
+	const marginRatio = totalCollateral.mul(TEN_THOUSAND).div(totalPositionValue);
+
+	return { totalCollateral, totalPositionValue, unrealizedPNL, marginRatio, partialMarginRequirement } ;
 }
 
 
@@ -209,7 +222,11 @@ interface User {
 	positionsAccount: UserPositionsAccount
 	ordersAccount: UserOrdersAccount,
 	upToDate: boolean
-	authority: string
+	authority: string,
+	totalPositionValue: BN, 
+    unrealizedPNL: BN, 
+    partialMarginRequirement: BN,
+    totalCollateral: BN
 }
 
 interface UnconfirmedTransaction {
@@ -299,7 +316,7 @@ export class OrderFiller {
 
 		this.intervalIds.push(setInterval(() => {
 			this.userMap.forEach(async user => {
-				this.userMap.set(user.publicKey, { ...user, marginRatio: getMarginRatio(this.clearingHouse, user) } as User);
+				this.userMap.set(user.publicKey, { ...user, ...getLiquidationMath(this.clearingHouse, user) } as User);
 			});
 		}, 500));
 
@@ -370,15 +387,45 @@ export class OrderFiller {
 			this.printTopOfOrdersList(ordersList.asc, ordersList.desc);
 		});
 	}
+	getUnrealizedPNL(user: User, withFunding?: boolean, marketIndex?: BN): BN {
+		return user.positionsAccount
+			.positions.filter((pos) =>
+				marketIndex ? pos.marketIndex === marketIndex : true
+			)
+			.reduce((pnl, marketPosition) => {
+				const market = this.clearingHouse.getMarket(marketPosition.marketIndex);
+				return pnl.add(
+					calculatePositionPNL(market, marketPosition, calculateBaseAssetValue(market, marketPosition), withFunding)
+				);
+			}, ZERO);
+	}
+	getInitialMarginRequirement(user: User): BN {
+		return user.positionsAccount.positions.reduce(
+			(marginRequirement, marketPosition) => {
+				const market = this.clearingHouse.getMarket(marketPosition.marketIndex);
+				return marginRequirement.add(
+					calculateBaseAssetValue(market, marketPosition)
+						.mul(new BN(market.marginRatioInitial))
+						.div(MARGIN_PRECISION)
+				);
+			},
+			ZERO
+		);
+	}
+	getFreeCollateral(user: User): BN {
+		const totalCollateral = user.totalCollateral;
+		const initialMarginRequirement = this.getInitialMarginRequirement(user);
+		const freeCollateral = totalCollateral.sub(initialMarginRequirement);
+		return freeCollateral.gte(ZERO) ? freeCollateral : ZERO;
+	}
 	updateUserOrders(user: User, userAccountPublicKey: PublicKey, userOrdersAccountPublicKey: PublicKey) : BN {
-		const marginRatio = getMarginRatio(this.clearingHouse, user);
+		const { marginRatio } = getLiquidationMath(this.clearingHouse, user);
 
 		const userOrdersAccount = user.ordersAccount;
 
 		if (userOrdersAccount) {
-			const tooMuchLeverage = marginRatio.lte(
-				this.clearingHouse.getStateAccount().marginRatioInitial
-			);
+			
+			const tooMuchLeverage = this.getFreeCollateral(user);
 
 			userOrdersAccount.orders.forEach(async order => {
 				const ordersLists = this.marketOrderLists.get(order.marketIndex.toNumber());
@@ -426,6 +473,7 @@ export class OrderFiller {
 		return marginRatio;
 	}
 	async fetchAllUsers() : Promise<void> {
+		
 		const programUserAccounts = await this.clearingHouse.program.account.user.all();
 		const userOrderAccounts = await this.clearingHouse.program.account.userOrders.all();
 		const userPositionsAccounts = await this.clearingHouse.program.account.userPositions.all();
