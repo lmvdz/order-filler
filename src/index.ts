@@ -20,15 +20,6 @@ import {
 	Wallet,
 	getClearingHouse,
 	getPollingClearingHouseConfig,
-	// calculateOrderFeeTier,
-	// calculateFeeForLimitOrder,
-	// calculateAmmReservesAfterSwap,
-	// SwapDirection,
-	// calculateNewMarketAfterTrade,
-	// PEG_PRECISION,
-	// AMM_TIMES_PEG_TO_QUOTE_PRECISION_RATIO,
-	// BASE_PRECISION,
-	// calculateAmountToTrade,
 	QUOTE_PRECISION,
 	DriftEnv,
 	UserAccount,
@@ -408,7 +399,8 @@ export class OrderFiller {
 		return freeCollateral.gte(ZERO) ? freeCollateral : ZERO;
 	}
 	updateUserOrders(user: User, userAccountPublicKey: PublicKey, userOrdersAccountPublicKey: PublicKey) : BN {
-		const { marginRatio } = this.getLiquidationMath(this.clearingHouse, user);
+		const liquidationMath = this.getLiquidationMath(this.clearingHouse, user);
+        this.userMap.set(user.publicKey, { ...user, ...liquidationMath });
 
 		const userOrdersAccount = user.ordersAccount;
 
@@ -459,7 +451,7 @@ export class OrderFiller {
 				}
 			});
 		}
-		return marginRatio;
+		return liquidationMath.marginRatio;
 	}
 	async fetchAllUsers() : Promise<void> {
 
