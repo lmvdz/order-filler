@@ -692,8 +692,21 @@ export class OrderFiller {
 					tx.recentBlockhash = this.blockhash;
 					tx.feePayer = this.wallet.publicKey;
 					tx = await this.clearingHouse.wallet.signTransaction(tx);
-					const txSig = await this.connection.sendRawTransaction(tx.serialize());
-					this.transactions.set(txSig, { tx: txSig, timestamp: Date.now() } as UnconfirmedTransaction);
+					
+					try {
+						const txSig = await this.connection.tpuClient.connection.sendRawTransaction(tx.serialize());
+						this.transactions.set(txSig, { tx: txSig, timestamp: Date.now() } as UnconfirmedTransaction);
+					} catch (error) {
+						console.error(error);
+					}
+
+					try {
+						const txSig = await this.connection.sendRawTransaction(tx.serialize());
+						this.transactions.set(txSig, { tx: txSig, timestamp: Date.now() } as UnconfirmedTransaction);
+					} catch (error) {
+						console.error(error);
+					}
+
 					this.cloudWatchClient.logFill(true);
 				} catch(error) {
 					nodeToFill.haveFilled = false;
