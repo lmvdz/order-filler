@@ -400,7 +400,8 @@ export class OrderFiller {
 	}
 	updateUserOrders(user: User, userAccountPublicKey: PublicKey, userOrdersAccountPublicKey: PublicKey) : BN {
 		const liquidationMath = this.getLiquidationMath(this.clearingHouse, user);
-        this.userMap.set(user.publicKey, { ...user, ...liquidationMath });
+		user = { ...user, ...liquidationMath };
+        this.userMap.set(user.publicKey, user);
 
 		const userOrdersAccount = user.ordersAccount;
 
