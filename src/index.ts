@@ -332,8 +332,10 @@ export class OrderFiller {
 	getLiquidationMath( clearingHouse: ClearingHouse, user: User ) : LiquidationMath {
 		const positions = user.positionsAccount.positions;
 		
+		let totalCollateral = user.userAccount.collateral;
+
 		if (positions.length === 0) {
-			return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+			return { totalCollateral, marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
 		}
 	
 		let totalPositionValue = ZERO, unrealizedPNL = ZERO, partialMarginRequirement = ZERO;
@@ -356,13 +358,15 @@ export class OrderFiller {
 	
 		// unrealizedPnLMap.set(user.publicKey, unrealizedPNL.toString());
 	
+
 		if (totalPositionValue.eq(ZERO)) {
-			return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+			return { totalCollateral, marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
 		}
-		const totalCollateral = (
-			user.userAccount.collateral.add(unrealizedPNL) ??
-			ZERO
-		);
+
+		totalCollateral = totalCollateral.add(unrealizedPNL) ?? ZERO;
+
+		
+
 		const marginRatio = totalCollateral.mul(TEN_THOUSAND).div(totalPositionValue);
 	
 		return { totalCollateral, totalPositionValue, unrealizedPNL, marginRatio, partialMarginRequirement } ;
