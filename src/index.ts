@@ -55,134 +55,35 @@ import { getErrorCode } from './error';
 require('dotenv').config();
 
 
-function isOrderRiskIncreasing(
-	positionsAccount: UserPositionsAccount,
-	order: Order
-): boolean {
-	if (isVariant(order.status, 'init')) {
-		return false;
-	}
-
-	const position =
-	positionsAccount.positions.find((position) =>
-			position.marketIndex.eq(order.marketIndex)
-		) || {
-			baseAssetAmount: ZERO,
-			lastCumulativeFundingRate: ZERO,
-			marketIndex: order.marketIndex,
-			quoteAssetAmount: ZERO,
-			openOrders: ZERO,
-		};
-
-	// if no position exists, it's risk increasing
-	if (position.baseAssetAmount.eq(ZERO)) {
-		return true;
-	}
-
-	// if position is long and order is long
-	if (position.baseAssetAmount.gt(ZERO) && isVariant(order.direction, 'long')) {
-		return true;
-	}
-
-	// if position is short and order is short
-	if (
-		position.baseAssetAmount.lt(ZERO) &&
-		isVariant(order.direction, 'short')
-	) {
-		return true;
-	}
-
-	const baseAssetAmountToFill = order.baseAssetAmount.sub(
-		order.baseAssetAmountFilled
-	);
-	// if order will flip position
-	if (baseAssetAmountToFill.gt(position.baseAssetAmount.abs().mul(TWO))) {
-		return true;
-	}
-
-	return false;
-}
-
-function calculatePositionPNL(
-	market: Market,
-	marketPosition: UserPosition,
-    baseAssetValue: BN,
-	withFunding = false
-): BN  {
-	if (marketPosition.baseAssetAmount.eq(ZERO)) {
-		return ZERO;
-	}
-
-	let pnlAssetAmount = (marketPosition.baseAssetAmount.gt(ZERO) ? baseAssetValue.sub(marketPosition.quoteAssetAmount) : marketPosition.quoteAssetAmount.sub(baseAssetValue));
-
-	if (withFunding) {
-		pnlAssetAmount = pnlAssetAmount.add(calculatePositionFundingPNL(
-			market,
-			marketPosition
-		).div(PRICE_TO_QUOTE_PRECISION));
-	}
-
-	return pnlAssetAmount;
-}
-
 interface LiquidationMath {
     totalPositionValue: BN, 
     unrealizedPNL: BN, 
     marginRatio: BN, 
     partialMarginRequirement: BN,
     totalCollateral: BN
-
-}
-
-function getLiquidationMath( clearingHouse: ClearingHouse, user: User ) : LiquidationMath {
-	const positions = user.positionsAccount.positions;
-	
-	if (positions.length === 0) {
-		return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
-	}
-
-	let totalPositionValue = ZERO, unrealizedPNL = ZERO, partialMarginRequirement = ZERO;
-
-	positions.forEach(position => {
-		const market = clearingHouse.getMarketsAccount().markets[position.marketIndex.toNumber()];
-		if (market !== undefined) {
-			const baseAssetAmountValue = calculateBaseAssetValue(market, position);
-			const marginRequirement = baseAssetAmountValue.mul(new BN(market.marginRatioPartial)).div(MARGIN_PRECISION);
-			partialMarginRequirement = partialMarginRequirement.add(marginRequirement);
-			totalPositionValue = totalPositionValue.add(baseAssetAmountValue);
-			unrealizedPNL = unrealizedPNL.add(this.calculatePositionPNL(market, position, baseAssetAmountValue, true));
-		} else {
-			console.log(user.userAccount.positions.toBase58(), user.publicKey);
-			console.log(market, position.marketIndex.toString());
-			console.log('market undefined', market);
-		}
-		
-	});
-
-	// unrealizedPnLMap.set(user.publicKey, unrealizedPNL.toString());
-
-	if (totalPositionValue.eq(ZERO)) {
-		return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
-	}
-	const totalCollateral = (
-		user.userAccount.collateral.add(unrealizedPNL) ??
-		ZERO
-	);
-	const marginRatio = totalCollateral.mul(TEN_THOUSAND).div(totalPositionValue);
-
-	return { totalCollateral, totalPositionValue, unrealizedPNL, marginRatio, partialMarginRequirement } ;
 }
 
 
-//@ts-ignore
-const sdkConfig = initialize({ env: process.env.ENV as DriftEnv });
+interface User {
+	marginRatio: BN,
+	publicKey: string,
+	positions: string,
+	orders: string,
+	userAccount: UserAccount
+	positionsAccount: UserPositionsAccount
+	ordersAccount: UserOrdersAccount,
+	upToDate: boolean
+	authority: string,
+	totalPositionValue: BN, 
+    unrealizedPNL: BN, 
+    partialMarginRequirement: BN,
+    totalCollateral: BN
+}
 
-const cloudWatchClient = new CloudWatchClient(
-	sdkConfig.ENV === 'mainnet-beta' ? 'eu-west-1' : 'us-east-1',
-	process.env.ENABLE_CLOUDWATCH === 'true'
-);
-
-
+interface UnconfirmedTransaction {
+	tx: string,
+	timestamp: number
+}
 
 function getWallet(): Wallet {
 	const botKeyEnvVariable = "BOT_KEY";
@@ -213,27 +114,6 @@ function getWallet(): Wallet {
 	return new Wallet(keypair);
 }
 
-interface User {
-	marginRatio: BN,
-	publicKey: string,
-	positions: string,
-	orders: string,
-	userAccount: UserAccount
-	positionsAccount: UserPositionsAccount
-	ordersAccount: UserOrdersAccount,
-	upToDate: boolean
-	authority: string,
-	totalPositionValue: BN, 
-    unrealizedPNL: BN, 
-    partialMarginRequirement: BN,
-    totalCollateral: BN
-}
-
-interface UnconfirmedTransaction {
-	tx: string,
-	timestamp: number
-}
-
 export class OrderFiller {
 	clearingHouse: ClearingHouse;
 	connection: TpuConnection;
@@ -251,10 +131,13 @@ export class OrderFiller {
 	blacklist: Array<string> = [];
 	blockhash: string
 	transactions: Map<string, UnconfirmedTransaction> = new Map<string, UnconfirmedTransaction>();
-	constructor(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection) {
+	cloudWatchClient: CloudWatchClient
+
+	constructor(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection, cloudWatchClient: CloudWatchClient) {
 		this.clearingHouse = clearingHouse;
 		this.connection = connection;
 		this.wallet = wallet;
+		this.cloudWatchClient = cloudWatchClient;
 		this.marketOrderLists = new Map<number, { desc: OrderList, asc: OrderList }>();
 		this.openOrders = new Set<number>();
 		this.nextOrderHistoryIndex = clearingHouse.getOrderHistoryAccount().head.toNumber();
@@ -316,7 +199,7 @@ export class OrderFiller {
 
 		this.intervalIds.push(setInterval(() => {
 			this.userMap.forEach(async user => {
-				this.userMap.set(user.publicKey, { ...user, ...getLiquidationMath(this.clearingHouse, user) } as User);
+				this.userMap.set(user.publicKey, { ...user, ...this.getLiquidationMath(this.clearingHouse, user) } as User);
 			});
 		}, 500));
 
@@ -358,10 +241,10 @@ export class OrderFiller {
 			});
 		}), 30 * 1000));
 	}
-	static async load(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection) : Promise<OrderFiller> {
+	static async load(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection, cloudWatchClient: CloudWatchClient) : Promise<OrderFiller> {
 		await clearingHouse.subscribe(['orderHistoryAccount']);
 		
-		return new OrderFiller(wallet, clearingHouse, connection);
+		return new OrderFiller(wallet, clearingHouse, connection, cloudWatchClient);
 	}
 	async getBalance() : Promise<number> {
 		return await this.clearingHouse.connection.getBalance(this.wallet.publicKey);
@@ -387,6 +270,112 @@ export class OrderFiller {
 			this.printTopOfOrdersList(ordersList.asc, ordersList.desc);
 		});
 	}
+	isOrderRiskIncreasing(
+		positionsAccount: UserPositionsAccount,
+		order: Order
+	): boolean {
+		if (isVariant(order.status, 'init')) {
+			return false;
+		}
+	
+		const position =
+		positionsAccount.positions.find((position) =>
+				position.marketIndex.eq(order.marketIndex)
+			) || {
+				baseAssetAmount: ZERO,
+				lastCumulativeFundingRate: ZERO,
+				marketIndex: order.marketIndex,
+				quoteAssetAmount: ZERO,
+				openOrders: ZERO,
+			};
+	
+		// if no position exists, it's risk increasing
+		if (position.baseAssetAmount.eq(ZERO)) {
+			return true;
+		}
+	
+		// if position is long and order is long
+		if (position.baseAssetAmount.gt(ZERO) && isVariant(order.direction, 'long')) {
+			return true;
+		}
+	
+		// if position is short and order is short
+		if (
+			position.baseAssetAmount.lt(ZERO) &&
+			isVariant(order.direction, 'short')
+		) {
+			return true;
+		}
+	
+		const baseAssetAmountToFill = order.baseAssetAmount.sub(
+			order.baseAssetAmountFilled
+		);
+		// if order will flip position
+		if (baseAssetAmountToFill.gt(position.baseAssetAmount.abs().mul(TWO))) {
+			return true;
+		}
+	
+		return false;
+	}
+	calculatePositionPNL(
+		market: Market,
+		marketPosition: UserPosition,
+		baseAssetValue: BN,
+		withFunding = false
+	): BN  {
+		if (marketPosition.baseAssetAmount.eq(ZERO)) {
+			return ZERO;
+		}
+	
+		let pnlAssetAmount = (marketPosition.baseAssetAmount.gt(ZERO) ? baseAssetValue.sub(marketPosition.quoteAssetAmount) : marketPosition.quoteAssetAmount.sub(baseAssetValue));
+	
+		if (withFunding) {
+			pnlAssetAmount = pnlAssetAmount.add(calculatePositionFundingPNL(
+				market,
+				marketPosition
+			).div(PRICE_TO_QUOTE_PRECISION));
+		}
+	
+		return pnlAssetAmount;
+	}
+	getLiquidationMath( clearingHouse: ClearingHouse, user: User ) : LiquidationMath {
+		const positions = user.positionsAccount.positions;
+		
+		if (positions.length === 0) {
+			return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+		}
+	
+		let totalPositionValue = ZERO, unrealizedPNL = ZERO, partialMarginRequirement = ZERO;
+	
+		positions.forEach(position => {
+			const market = clearingHouse.getMarketsAccount().markets[position.marketIndex.toNumber()];
+			if (market !== undefined) {
+				const baseAssetAmountValue = calculateBaseAssetValue(market, position);
+				const marginRequirement = baseAssetAmountValue.mul(new BN(market.marginRatioPartial)).div(MARGIN_PRECISION);
+				partialMarginRequirement = partialMarginRequirement.add(marginRequirement);
+				totalPositionValue = totalPositionValue.add(baseAssetAmountValue);
+				unrealizedPNL = unrealizedPNL.add(this.calculatePositionPNL(market, position, baseAssetAmountValue, true));
+			} else {
+				console.log(user.userAccount.positions.toBase58(), user.publicKey);
+				console.log(market, position.marketIndex.toString());
+				console.log('market undefined', market);
+			}
+			
+		});
+	
+		// unrealizedPnLMap.set(user.publicKey, unrealizedPNL.toString());
+	
+		if (totalPositionValue.eq(ZERO)) {
+			return { marginRatio: BN_MAX, totalPositionValue: ZERO, unrealizedPNL: ZERO, partialMarginRequirement: ZERO } as LiquidationMath;
+		}
+		const totalCollateral = (
+			user.userAccount.collateral.add(unrealizedPNL) ??
+			ZERO
+		);
+		const marginRatio = totalCollateral.mul(TEN_THOUSAND).div(totalPositionValue);
+	
+		return { totalCollateral, totalPositionValue, unrealizedPNL, marginRatio, partialMarginRequirement } ;
+	}
 	getUnrealizedPNL(user: User, withFunding?: boolean, marketIndex?: BN): BN {
 		return user.positionsAccount
 			.positions.filter((pos) =>
@@ -395,7 +384,7 @@ export class OrderFiller {
 			.reduce((pnl, marketPosition) => {
 				const market = this.clearingHouse.getMarket(marketPosition.marketIndex);
 				return pnl.add(
-					calculatePositionPNL(market, marketPosition, calculateBaseAssetValue(market, marketPosition), withFunding)
+					this.calculatePositionPNL(market, marketPosition, calculateBaseAssetValue(market, marketPosition), withFunding)
 				);
 			}, ZERO);
 	}
@@ -419,7 +408,7 @@ export class OrderFiller {
 		return freeCollateral.gte(ZERO) ? freeCollateral : ZERO;
 	}
 	updateUserOrders(user: User, userAccountPublicKey: PublicKey, userOrdersAccountPublicKey: PublicKey) : BN {
-		const { marginRatio } = getLiquidationMath(this.clearingHouse, user);
+		const { marginRatio } = this.getLiquidationMath(this.clearingHouse, user);
 
 		const userOrdersAccount = user.ordersAccount;
 
@@ -430,7 +419,7 @@ export class OrderFiller {
 			userOrdersAccount.orders.forEach(async order => {
 				const ordersLists = this.marketOrderLists.get(order.marketIndex.toNumber());
 				const orderList = ordersLists[sortDirectionForOrder(order)];
-				const orderIsRiskIncreasing = isOrderRiskIncreasing(user.positionsAccount, order);
+				const orderIsRiskIncreasing = this.isOrderRiskIncreasing(user.positionsAccount, order);
 
 				const orderId = order.orderId.toNumber();
 				if (tooMuchLeverage && orderIsRiskIncreasing) {
@@ -473,7 +462,7 @@ export class OrderFiller {
 		return marginRatio;
 	}
 	async fetchAllUsers() : Promise<void> {
-		
+
 		const programUserAccounts = await this.clearingHouse.program.account.user.all();
 		const userOrderAccounts = await this.clearingHouse.program.account.userOrders.all();
 		const userPositionsAccounts = await this.clearingHouse.program.account.userPositions.all();
@@ -598,7 +587,6 @@ export class OrderFiller {
 		
 		
 	}
-
 	async updateOrderList() : Promise<void> {
 		if (this.updateOrderListMutex === 1) {
 			return;
@@ -709,14 +697,14 @@ export class OrderFiller {
 					tx = await this.clearingHouse.wallet.signTransaction(tx);
 					const txSig = await this.connection.sendRawTransaction(tx.serialize());
 					this.transactions.set(txSig, { tx: txSig, timestamp: Date.now() } as UnconfirmedTransaction);
-					cloudWatchClient.logFill(true);
+					this.cloudWatchClient.logFill(true);
 				} catch(error) {
 					nodeToFill.haveFilled = false;
 					this.userMap.set(nodeToFill.userAccount.toString(), { ...this.userMap.get(nodeToFill.userAccount.toString()), upToDate: true });
 					console.log(
 						`Error filling user (account: ${nodeToFill.userAccount.toString()}) order: ${nodeToFill.order.orderId.toString()}`
 					);
-					cloudWatchClient.logFill(false);
+					this.cloudWatchClient.logFill(false);
 
 					// If we get an error that order does not exist, assume its been filled by somebody else and we
 					// have received the history record yet
@@ -763,6 +751,14 @@ function memoryRestart(orderFiller: OrderFiller) {
 
 async function main() {
 
+
+	const sdkConfig = initialize({ env: process.env.ENV as DriftEnv });
+
+	const cloudWatchClient = new CloudWatchClient(
+		sdkConfig.ENV === 'mainnet-beta' ? 'eu-west-1' : 'us-east-1',
+		process.env.ENABLE_CLOUDWATCH === 'true'
+	);
+
 	const endpoint = process.env.ENDPOINT;
 	const connection = await TpuConnection.load(endpoint);
 	const wallet = getWallet();
@@ -782,7 +778,7 @@ async function main() {
 		)
 	);
 
-	const orderFiller = await OrderFiller.load(wallet, clearingHouse, connection);
+	const orderFiller = await OrderFiller.load(wallet, clearingHouse, connection, cloudWatchClient);
 	orderFiller.start();
 
 	memoryRestart(orderFiller);
