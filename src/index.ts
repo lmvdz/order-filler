@@ -105,6 +105,16 @@ function getWallet(): Wallet {
 	return new Wallet(keypair);
 }
 
+// interface OrderRecordAggregate {
+// 	count: number,
+// 	totalReward: BN
+
+// }
+
+// type OrderRecordCompilation = { 
+// 	[key: string]: OrderRecordAggregate
+// };
+
 export class OrderFiller {
 	clearingHouse: ClearingHouse;
 	connection: TpuConnection;
@@ -231,6 +241,26 @@ export class OrderFiller {
 				}, index * 1000);
 			});
 		}), 30 * 1000));
+
+		// // print out rewards
+		// this.intervalIds.push(setInterval((() => {
+		// 	const orderRecordCount = {} as OrderRecordCompilation;
+		// 	this.clearingHouse.getOrderHistoryAccount().orderRecords.forEach(async orderRecord => {
+		// 		if (orderRecordCount[orderRecord.filler.toBase58()]) {
+		// 			orderRecordCount[orderRecord.filler.toBase58()].count++;
+		// 			orderRecordCount[orderRecord.filler.toBase58()].totalReward = orderRecordCount[orderRecord.filler.toBase58()].totalReward.add(orderRecord.fillerReward);
+		// 			if (orderRecord.filler.toBase58() === '5igTNp6T23mNWTHSi4Rp9pzm5NfZ31TuFa4XMSnrQEy7') {
+		// 				console.log(orderRecord.authority.toBase58());
+		// 			}
+		// 		} else {
+		// 			orderRecordCount[orderRecord.filler.toBase58()] = { 
+		// 				count: 1,
+		// 				totalReward: ZERO
+		// 			} as OrderRecordAggregate;
+		// 		}
+		// 	});
+		// 	console.log(orderRecordCount);
+		// }), 1000 * 5));
 	}
 	static async load(wallet: Wallet, clearingHouse: ClearingHouse, connection: TpuConnection, cloudWatchClient: CloudWatchClient) : Promise<OrderFiller> {
 		await clearingHouse.subscribe(['orderHistoryAccount']);

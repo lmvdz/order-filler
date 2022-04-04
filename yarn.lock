@@ -42,10 +42,10 @@
   dependencies:
     "@cspotcode/source-map-consumer" "0.8.0"
 
-"@drift-labs/sdk@0.1.26":
-  version "0.1.26"
-  resolved "https://registry.yarnpkg.com/@drift-labs/sdk/-/sdk-0.1.26.tgz#18536aa0d1754a3a8ad0a443cec2aba0bd7a47de"
-  integrity sha512-OF5yd++wqwScDU1g7Zl6cc3zGW3Qm9lUdSB8ROHXL0Fw4GnTk+ugQYnzgpCx7cKa+BCJO+js4ryI+VtaPIbYGg==
+"@drift-labs/sdk@0.1.29":
+  version "0.1.29"
+  resolved "https://registry.yarnpkg.com/@drift-labs/sdk/-/sdk-0.1.29.tgz#d0dca6bd4abcdddc87172423175c87a0cca69b38"
+  integrity sha512-+Sb/C4D4IqUu3+ej3yZ3n4n6vO0D3Ur6ruHdYnb7FyvvMrO3bExW+0JB7ZM/x20BNORRMn49bt6OVCFXHQTzSA==
   dependencies:
     "@project-serum/anchor" "0.19.1-beta.1"
     "@pythnetwork/client" "^2.5.1"
